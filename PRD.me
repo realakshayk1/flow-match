@@ -1,0 +1,416 @@
+# PRD: 3D Ligand Conformation Generation via SE(3)-Equivariant Flow Matching
+
+**Project Type:** ML Research Project  
+**Timeline:** 6–8 weeks  
+**Compute:** Laptop only (CPU + Apple MPS or CUDA if available; no cluster)  
+**Priority:** Generative model (EGNN + flow matching) > evaluation pipeline  
+**Status:** Not started
+
+---
+
+## 1. Problem Statement
+
+Classical docking pipelines (AutoDock, Glide) generate ligand binding conformations by exhaustive search over rotatable bonds, scoring against a force field. They are computationally expensive, non-differentiable, and cannot be trained end-to-end. Recent ML approaches (DiffSBDD, AlphaFold3's diffusion module) show learned generative models can recover physically valid 3D conformations — but most operate in diffusion space, requiring hundreds of inference steps.
+
+**This project asks:** Can a flow matching model, parameterized by a lightweight SE(3)-equivariant GNN, generate low-strain small molecule binding conformations that respect pocket geometry, trainable on a laptop in under 8 weeks?
+
+**Scientific hypothesis:** Flow matching's straight probability paths require fewer ODE steps than DDPM at equivalent quality, making it tractable on CPU/MPS while still producing conformations with lower MMFF94 strain energy than the ETKDG classical baseline.
+
+---
+
+## 2. Compute Strategy (Laptop-First Design)
+
+This is the most important section given the constraint. Every architectural and data decision flows from it.
+
+### 2.1 Dataset Scope: 500 complexes, not 5000
+Training on the full PDBBind refined set (~5k complexes) with an EGNN on CPU would take weeks per epoch. Instead:
+- **Train set:** 400 complexes (PDBBind 2020 refined, filtered subset)
+- **Val set:** 50 complexes
+- **Test set:** 50 complexes (sampled from PDBBind core set)
+- **Filtering:** MW < 500 Da, ≤ 7 rotatable bonds, ≤ 30 heavy atoms — keeps graphs small and forward passes fast
+
+At batch size 8, ~50 complexes/epoch on CPU with a 4-layer EGNN takes ~5–10 min/epoch. 100 epochs = ~8–16 hours of training, spread across the week. Feasible overnight.
+
+### 2.2 Model Size: Small but principled
+- EGNN hidden dim: **64** (not 128/256)
+- EGNN layers: **4** (not 6/8)
+- Pocket encoding: **point cloud only** (no residue-level GNN, no ESM embeddings)
+- Cross-graph edges: **k=4** (not k=8)
+- Parameter count target: **< 500K** — fast forward pass, fast gradient
+
+### 2.3 Flow Matching Steps
+- Training: Euler with 1 step (single forward pass per sample, standard FM)
+- Inference: Euler with **20 steps** (not 50–100) — sufficient for small molecules
+- Each inference call: < 2 seconds on CPU for a 30-atom ligand
+
+### 2.4 Precomputation (critical)
+All graph construction — featurization, edge building, pocket extraction — must be precomputed and saved as `.pt` files before any training run. Zero data processing during training loops.
+
+---
+
+## 3. Goals & Success Metrics
+
+### Primary
+| Metric | Target | Baseline (ETKDG) | Notes |
+|--------|--------|-----------------|-------|
+| Median RMSD to crystal pose | < 3.0 Å | ~2.5–3.5 Å | Laptop-realistic target |
+| MMFF94 strain energy ratio | ≤ 1.3× ETKDG | 1.0× (reference) | Key differentiator |
+| Equivariance error | < 1e-4 | N/A | Unit test must pass |
+| Inference time per molecule | < 5s on CPU | ~0.3s (ETKDG) | Acceptable tradeoff |
+
+### Secondary (good-to-have)
+| Metric | Target |
+|--------|--------|
+| % conformations RMSD < 2Å | > 25% |
+| FM vs no-pocket ablation | FM ≥ 10% better median RMSD |
+| Training convergence | Val loss plateau within 80 epochs |
+
+---
+
+## 4. Architecture Overview
+
+```
+Input (at inference):
+  Pocket point cloud — atoms within 10Å of ligand centroid
+  Ligand graph — topology only (atom types, bonds), NO coordinates
+
+────────────────────────────────────────────────────────
+Stage 1: Featurization  (precomputed, saved to disk)
+────────────────────────────────────────────────────────
+Ligand nodes:   [atom_type_onehot(10), charge(1), hybridization(3),
+                 aromaticity(1), degree(1), in_ring(1)]  → 17-dim
+Ligand edges:   [bond_type(4), conjugated(1), in_ring(1)]  → 6-dim
+Pocket nodes:   [element_onehot(8), is_backbone(1), residue_onehot(20)] → 29-dim
+Pocket edges:   RBF(||xi - xj||, 16 basis functions) → 16-dim (dist < 6Å)
+Cross edges:    ligand atom ↔ pocket atom, k=4 nearest, RBF dist features
+
+────────────────────────────────────────────────────────
+Stage 2: EGNN  (4 layers, hidden_dim=64)
+────────────────────────────────────────────────────────
+Each EGNN layer:
+  m_ij = MLP([h_i, h_j, ||x_i-x_j||², edge_attr])   # message
+  x_i' = x_i + Σ_j (x_i - x_j) · MLP(m_ij)          # coord update
+  h_i' = MLP([h_i, Σ_j m_ij])                         # node update
+
+Pocket coords are fixed (not updated by coord update).
+Cross-graph messages flow pocket→ligand only.
+
+────────────────────────────────────────────────────────
+Stage 3: Flow Matching
+────────────────────────────────────────────────────────
+Training:
+  x_0 ~ N(0, I)                        # Gaussian noise
+  x_1 = crystal coords                 # ground truth
+  t ~ Uniform(0, 1)
+  x_t = (1-t)·x_0 + t·x_1             # linear interpolant
+  target = x_1 - x_0                   # constant velocity field
+  loss = ||EGNN(x_t, pocket, t) - target||²
+
+Inference (20-step Euler):
+  x_0 ~ N(0, I)
+  for t in linspace(0, 1, 20):
+      x = x + (1/20) · EGNN(x, pocket, t)
+
+────────────────────────────────────────────────────────
+Stage 4: Post-processing
+────────────────────────────────────────────────────────
+  Assign generated coords to RDKit mol
+  Chirality correction via AssignStereochemistryFromCoords
+  MMFF94 energy calculation (score only, no minimization)
+  Bond length sanity check (flag outliers)
+```
+
+---
+
+## 5. Tech Stack
+
+| Component | Tool | Notes |
+|-----------|------|-------|
+| Molecular graphs | `rdkit` 2023.09+ | Featurization, MMFF94, ETKDG |
+| Pocket extraction | `MDAnalysis` 2.7+ | Pocket atom selection |
+| GNN framework | `torch_geometric` 2.5+ | HeteroData, DataLoader |
+| EGNN | **Custom, from scratch** | ~200 lines PyTorch, no e3nn |
+| Flow matching ODE | `torchdiffeq` 0.2.3 | Euler only; torchdiffeq for inference |
+| Data | PDBBind 2020 refined | Request access today |
+| Dev data | PDBBind 2016 core (public) | Use while waiting for 2020 access |
+| Tracking | `wandb` free tier | Loss, RMSD per epoch |
+| Visualization | `py3Dmol` in Jupyter | Overlay generated vs crystal |
+| Environment | `conda` + `environment.yml` | Pin all versions |
+
+**Explicitly excluded (laptop constraint):**
+- `e3nn` — complex irrep machinery, CPU bottleneck
+- `gnina` — GPU-only docking evaluator
+- CrossDocked2020 — too large to preprocess locally
+- ESM-2 pocket embeddings — inference cost per forward pass
+
+---
+
+## 6. Data Pipeline
+
+### 6.1 Acquisition
+- Request PDBBind 2020 at pdbbind.org.cn **today** (2–5 day approval window)
+- While waiting: download PDBBind 2016 core set (public, 290 complexes) for full dev cycle
+
+### 6.2 Processing (`scripts/process_pdbbind.py`)
+```
+For each PDB entry:
+  1. Load protein PDB + ligand SDF (MDAnalysis)
+  2. Extract pocket: protein atoms within 10Å of ligand centroid
+  3. Sanitize ligand (RDKit): remove Hs, assign bond orders, check validity
+  4. Apply filters: MW < 500, rotatable bonds ≤ 7, heavy atoms ≤ 30, no metals
+  5. Featurize ligand → torch_geometric Data (node_attr, edge_index, edge_attr, pos)
+  6. Featurize pocket → Data object (node_attr, edge_index, edge_attr, pos)
+  7. Build cross edges: k=4 NN from ligand atoms to pocket atoms + RBF features
+  8. Save as HeteroData .pt file: data['ligand'], data['pocket']
+  9. Log: complex_id, n_lig_atoms, n_poc_atoms, MW, passed_filter
+```
+
+### 6.3 Splits (deterministic, seed=42)
+```python
+test_ids  = pdbbind_core_ids & filtered_ids          # ~50
+val_ids   = random.sample(remaining, 50)
+train_ids = remaining - val_ids                       # ~300-400
+```
+
+---
+
+## 7. EGNN Implementation (full code)
+
+Implement from scratch per Satorras et al. 2021.
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class EGNNLayer(nn.Module):
+    """
+    E(n)-Equivariant GNN layer. Satorras, Hoogeboom, Welling. ICML 2021.
+    Equivariant to rotations, translations, reflections.
+    """
+    def __init__(self, hidden_dim, edge_dim):
+        super().__init__()
+        act = nn.SiLU()
+        self.phi_e = nn.Sequential(          # message network (scalar)
+            nn.Linear(2*hidden_dim + 1 + edge_dim, hidden_dim), act,
+            nn.Linear(hidden_dim, hidden_dim), act,
+        )
+        self.phi_x = nn.Sequential(          # coord weight (scalar output)
+            nn.Linear(hidden_dim, hidden_dim), act,
+            nn.Linear(hidden_dim, 1),
+        )
+        self.phi_h = nn.Sequential(          # node update (scalar)
+            nn.Linear(2*hidden_dim, hidden_dim), act,
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h, x, edge_index, edge_attr, fixed_mask=None):
+        row, col = edge_index
+        diff    = x[row] - x[col]                           # [E, 3]
+        dist_sq = (diff**2).sum(-1, keepdim=True)           # [E, 1]
+
+        m_ij = self.phi_e(torch.cat([h[row], h[col], dist_sq, edge_attr], -1))
+        coord_delta = diff * self.phi_x(m_ij)               # [E, 3] equivariant
+
+        coord_agg = torch.zeros_like(x)
+        coord_agg.scatter_add_(0, col.unsqueeze(-1).expand_as(diff), coord_delta)
+        if fixed_mask is not None:
+            coord_agg[fixed_mask] = 0                       # pocket stays fixed
+
+        m_agg = torch.zeros(h.size(0), m_ij.size(-1), device=h.device)
+        m_agg.scatter_add_(0, col.unsqueeze(-1).expand_as(m_ij), m_ij)
+
+        return self.phi_h(torch.cat([h, m_agg], -1)), x + coord_agg
+
+
+class EGNNFlowModel(nn.Module):
+    """EGNN-parameterized velocity field for flow matching."""
+    def __init__(self, lig_dim, poc_dim, edge_dim, hidden=64, n_layers=4):
+        super().__init__()
+        self.lig_emb = nn.Linear(lig_dim + 1, hidden)       # +1 for time
+        self.poc_emb = nn.Linear(poc_dim, hidden)
+        self.layers  = nn.ModuleList([EGNNLayer(hidden, edge_dim) for _ in range(n_layers)])
+        self.out     = nn.Linear(hidden, 3)
+
+    def forward(self, lig_h, lig_x, poc_h, poc_x, edge_index, edge_attr, t):
+        t_feat  = t.expand(lig_h.size(0), 1)
+        h = torch.cat([self.lig_emb(torch.cat([lig_h, t_feat], -1)),
+                        self.poc_emb(poc_h)], dim=0)
+        x = torch.cat([lig_x, poc_x], dim=0)
+        n_lig = lig_h.size(0)
+
+        fixed = torch.zeros(h.size(0), dtype=torch.bool, device=h.device)
+        fixed[n_lig:] = True
+
+        for layer in self.layers:
+            h, x = layer(h, x, edge_index, edge_attr, fixed)
+
+        return self.out(h[:n_lig])                          # velocity for ligand atoms only
+```
+
+### Equivariance Unit Test — hard gate before any training
+```python
+def test_equivariance(model, batch, tol=1e-4):
+    R = torch.linalg.qr(torch.randn(3, 3))[0]              # random rotation matrix
+    v1 = model(batch.lig_h, batch.lig_x, ...)
+    v2 = model(batch.lig_h, batch.lig_x @ R.T, batch.poc_h, batch.poc_x @ R.T, ...)
+    err = (v2 - v1 @ R.T).abs().max()
+    assert err < tol, f"Equivariance broken: {err:.2e}"
+    print(f"✓ Passed (max error {err:.2e})")
+```
+
+---
+
+## 8. Training & Inference
+
+```python
+# --- Training ---
+def train_epoch(model, loader, optimizer):
+    model.train()
+    for batch in loader:
+        x_0 = torch.randn_like(batch.lig_pos)
+        x_1 = batch.lig_pos
+        t   = torch.rand(1)
+        x_t = (1 - t) * x_0 + t * x_1
+        v   = model(batch.lig_h, x_t, batch.poc_h, batch.poc_x, ...)
+        loss = F.mse_loss(v, x_1 - x_0)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step(); optimizer.zero_grad()
+
+# --- Inference (20-step Euler) ---
+def generate(model, batch, n_steps=20):
+    model.eval()
+    x = torch.randn_like(batch.lig_pos)
+    dt = 1.0 / n_steps
+    for t in torch.linspace(0, 1 - dt, n_steps):
+        with torch.no_grad():
+            v = model(batch.lig_h, x, batch.poc_h, batch.poc_x, ..., t.unsqueeze(0))
+        x = x + dt * v
+    return x
+```
+
+---
+
+## 9. Evaluation Suite
+
+### 9.1 RMSD (geometric fidelity)
+```python
+def kabsch_rmsd(P, Q):
+    Pc, Qc = P - P.mean(0), Q - Q.mean(0)
+    U, _, Vt = torch.linalg.svd(Pc.T @ Qc)
+    d = torch.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ torch.diag(torch.tensor([1., 1., d])) @ U.T
+    return ((Pc @ R.T - Qc)**2).sum(-1).mean().sqrt().item()
+# Report: median, mean, % < 1/2/5Å over 50 test complexes
+```
+
+### 9.2 MMFF94 Strain Energy (physical validity — the key metric)
+```python
+def mmff94_energy(mol, coords):
+    conf = mol.GetConformer()
+    for i, (x,y,z) in enumerate(coords): conf.SetAtomPosition(i, (x,y,z))
+    ff = AllChem.MMFFGetMoleculeForceField(mol, AllChem.MMFFGetMoleculeProperties(mol))
+    return ff.CalcEnergy() if ff else None
+# Report: E_generated / E_ETKDG ratio (target ≤ 1.3)
+```
+
+### 9.3 Ablations
+| Condition | Change |
+|-----------|--------|
+| Full model | EGNN + FM + pocket conditioning |
+| No pocket | Remove all cross-graph edges |
+| ETKDG | RDKit classical baseline |
+
+---
+
+## 10. Task Breakdown
+
+### Phase 1: Data & Environment (Week 1)
+- [ ] **T1.1** Request PDBBind 2020 access ← **do today**
+- [ ] **T1.2** Download PDBBind 2016 core (public) as dev dataset
+- [ ] **T1.3** Create conda env: rdkit, torch, torch_geometric, MDAnalysis, torchdiffeq, wandb
+- [ ] **T1.4** Write `scripts/process_pdbbind.py` (pocket extraction + featurization)
+- [ ] **T1.5** Run pipeline on 2016 core, verify ~200 complexes pass filters
+- [ ] **T1.6** Verify DataLoader yields correct shapes on a sample batch
+- [ ] **T1.7** Save `splits.json`
+
+### Phase 2: EGNN (Week 2)
+- [ ] **T2.1** Implement `EGNNLayer` from scratch per Section 7
+- [ ] **T2.2** **Run equivariance unit test — hard gate, do not proceed until passing**
+- [ ] **T2.3** Implement `EGNNFlowModel` (4 layers)
+- [ ] **T2.4** Verify forward pass shapes on a single batch
+- [ ] **T2.5** Profile CPU forward pass time — target < 100ms at batch_size=8
+
+### Phase 3: Flow Matching (Week 3)
+- [ ] **T3.1** Toy FM sanity check: 2D moons dataset, visualize trajectories
+- [ ] **T3.2** Implement `train_epoch` and `generate` (Section 8)
+- [ ] **T3.3** Overfit on 5 complexes (200 epochs) — verify train RMSD < 0.5Å
+- [ ] **T3.4** Connect wandb logging (loss, grad norm, sample RMSD every 10 epochs)
+- [ ] **T3.5** Add cosine LR decay with 5-epoch warmup
+
+### Phase 4: Training (Week 4)
+- [ ] **T4.1** Train on full train set overnight (~80–100 epochs)
+- [ ] **T4.2** Compare 3 configs: hidden_dim = 32 / 64 / 128
+- [ ] **T4.3** Early stopping on val RMSD (patience = 15 epochs)
+- [ ] **T4.4** Save best checkpoint as `checkpoints/best_model.pt`
+
+### Phase 5: Evaluation (Week 5)
+- [ ] **T5.1** Generate conformations for all 50 test complexes
+- [ ] **T5.2** Run ETKDG on all 50 test complexes (RDKit, ~1 min)
+- [ ] **T5.3** Compute Kabsch RMSD distributions (generated vs crystal, ETKDG vs crystal)
+- [ ] **T5.4** Compute MMFF94 strain energy ratios
+- [ ] **T5.5** Retrain no-pocket ablation overnight, compute delta RMSD
+- [ ] **T5.6** Generate result table + RMSD histogram figure
+
+### Phase 6: Polish (Week 6)
+- [ ] **T6.1** Write README with architecture overview and results table
+- [ ] **T6.2** Add `scripts/verify_equivariance.py` as standalone script
+- [ ] **T6.3** Create py3Dmol Jupyter notebook: overlay generated vs crystal (3 complexes)
+- [ ] **T6.4** Push public to GitHub
+
+---
+
+## 11. Key Papers (read in order)
+
+1. **Satorras et al. 2021** — "E(n) Equivariant Graph Neural Networks" — implement from this
+2. **Lipman et al. 2022** — "Flow Matching for Generative Modeling" — FM math
+3. **Liu et al. 2022** — "Flow Straight and Fast: Rectified Flow" — simpler FM variant, good backup
+4. **Yim et al. 2023** — "FrameDiff" — closest structural-bio relative
+5. **Corso et al. 2023** — "DiffSBDD" — structure-based drug design with equivariant diffusion; primary comparison point
+
+---
+
+## 12. Risks & Mitigations
+
+| Risk | Likelihood | Mitigation |
+|------|-----------|------------|
+| PDBBind 2020 access delayed | Medium | Use 2016 core (public) for full cycle; swap for final run |
+| EGNN equivariance bug (silent) | **High** | T2.2 is a hard gate — never skip |
+| CPU training too slow | Medium | Drop hidden_dim to 32, batch_size to 4, use 50 complexes |
+| Val RMSD worse than ETKDG | Medium | Reframe around strain energy — still a valid result |
+| Chirality assignment fails | Low | Flag as limitation in README |
+| ODE divergence at inference | Low | Clip coord updates to max 5Å per step |
+
+---
+
+## 13. Assumptions
+
+- Laptop has ≥ 16GB RAM
+- Python 3.10+, PyTorch 2.0+
+- MPS or CUDA used if available (auto-detect), but not required
+- PDBBind 2016 core used for development; 2020 refined for final results if access granted
+- EGNN implemented from paper equations, not a library (no e3nn)
+
+---
+
+## 14. Out of Scope
+
+- Protein flexibility (pocket is rigid)
+- De novo ligand generation (topology known at inference)
+- Multi-pose generation
+- Covalent binders, metalloenzymes
+- GPU-accelerated docking (gnina)
+- Hyperparameter search beyond 3 manual runs
+
+---
+
+*Revised for laptop-only compute — April 2026*
