@@ -1,0 +1,25 @@
+# Core ML
+# torch is installed separately via setup script (needs --index-url for CPU wheels)
+torch-geometric==2.5.3
+
+# Chemistry
+rdkit==2024.3.5
+MDAnalysis==2.7.0
+
+# Data / compute
+numpy==1.26.4
+scipy==1.13.0
+pandas==2.2.2
+tqdm==4.66.4
+
+# Training utilities
+wandb==0.17.0
+
+# Visualization (notebook only)
+matplotlib==3.9.0
+py3Dmol==2.1.0
+ipykernel
+notebook
+
+# Testing
+pytest==8.2.2
