@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+data/raw/
+data/processed/
+checkpoints/
+wandb/
+*.pt
+__pycache__/
+*.egg-info/
