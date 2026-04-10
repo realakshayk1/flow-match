@@ -302,7 +302,7 @@ def parse_args():
     p.add_argument("--patience",         type=int,   default=15)
     p.add_argument("--n_inference_steps", type=int,  default=20)
     p.add_argument("--checkpoint_dir",   default="checkpoints")
-    p.add_argument("--wandb_project",    default="flow-match")
+    p.add_argument("--wandb_project",    default="")
     p.add_argument("--device",           default="auto",
                    choices=["auto", "cpu", "cuda", "mps"])
     return p.parse_args()
