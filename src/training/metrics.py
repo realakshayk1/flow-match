@@ -50,14 +50,17 @@ def kabsch_rmsd(P: Tensor, Q: Tensor) -> float:
     # Cross-covariance
     H = Pc.T @ Qc   # [3, 3]
 
-    U, S, Vt = torch.linalg.svd(H)
+    try:
+        U, S, Vt = torch.linalg.svd(H)
+        d = torch.linalg.det(Vt.T @ U.T)
+        D = torch.diag(torch.tensor([1.0, 1.0, d.sign()], device=P.device))
+        R = Vt.T @ D @ U.T
+        P_rot = Pc @ R.T
+    except torch._C._LinAlgError:
+        # Degenerate case (e.g. near-zero coords early in training).
+        # Fall back to unaligned RMSD — pessimistic but never crashes.
+        P_rot = Pc
 
-    # Correct for reflection (det check)
-    d = torch.linalg.det(Vt.T @ U.T)
-    D = torch.diag(torch.tensor([1.0, 1.0, d.sign()], device=P.device))
-    R = Vt.T @ D @ U.T   # optimal rotation
-
-    P_rot = Pc @ R.T   # [N, 3]
     rmsd = ((P_rot - Qc).pow(2).sum(-1).mean().sqrt()).item()
     return rmsd
 
