@@ -84,8 +84,10 @@ class FlowMatcher(nn.Module):
         """
         Compute flow matching MSE loss on a batch.
 
-        t is sampled once per molecule (not per atom), then broadcast
-        using the batch assignment vector so each atom gets its molecule's t.
+        t is sampled once per molecule (not per atom).  All coordinates are
+        centered on the pocket centroid before the model call to prevent
+        coordinate-scale explosion in EGNN cross edges (crystal PDB coords
+        vs. N(0,I) noise have ~50 Å offsets that blow up dist_sq).
 
         Returns: scalar loss averaged over atoms.
         """
@@ -97,36 +99,35 @@ class FlowMatcher(nn.Module):
         device   = lig_x1.device
 
         # Sample t per molecule
-        t_per_graph = torch.rand(n_graphs, device=device)          # [n_graphs]
-        t_per_atom  = t_per_graph[lig_batch]                       # [N_total]
+        t_per_graph = torch.rand(n_graphs, device=device)   # [n_graphs]
 
-        # Sample x_0 ~ N(0, I)
-        x0 = torch.randn_like(lig_x1)
+        # Run one forward pass per graph (different t per molecule requires this)
+        v_pred_list  = []
+        target_list  = []
 
-        # Interpolate: x_t = (1 - t) * x_0 + t * x_1
-        t_3d = t_per_atom.unsqueeze(-1)    # [N_total, 1]
-        x_t  = (1.0 - t_3d) * x0 + t_3d * lig_x1
-
-        # Target velocity (constant): v* = x_1 - x_0
-        target = lig_x1 - x0               # [N_total, 3]
-
-        # Need a single t per graph for the model forward call.
-        # Since EGNNFlowModel's forward takes a scalar t and broadcasts it to
-        # all N_lig atoms, we must handle the batched case where different
-        # molecules in the batch have different t values.
-        #
-        # Strategy: run one forward pass per graph in the batch.
-        # For small batch sizes (8) and moderate graph sizes, this is acceptable.
-        # For large-scale training, a batched implementation would be preferred.
-        v_pred_list = []
         for g in range(n_graphs):
             mask_lig = lig_batch == g
             mask_poc = unpacked["poc_batch"] == g
 
-            # Extract per-graph tensors
-            lig_x_g  = x_t[mask_lig]
+            # Crystal ligand and pocket positions for this graph
+            lig_x1_g = lig_x1[mask_lig]                   # [N_lig, 3]
+            poc_x_g  = unpacked["poc_x"][mask_poc]         # [M_poc, 3]
+
+            # Center on pocket centroid so that N(0,I) noise and pocket
+            # coordinates are in the same ~Angstrom-scale neighbourhood.
+            poc_center = poc_x_g.mean(0, keepdim=True)     # [1, 3]
+            lig_x1_g   = lig_x1_g - poc_center
+            poc_x_g    = poc_x_g  - poc_center
+
+            # Sample x_0 ~ N(0, I) in centered space and interpolate
+            x0_g  = torch.randn_like(lig_x1_g)
+            t_g   = t_per_graph[g]
+            x_t_g = (1.0 - t_g) * x0_g + t_g * lig_x1_g
+
+            # Target velocity: v* = x_1 - x_0  (same formula, centered space)
+            target_list.append(lig_x1_g - x0_g)
+
             lig_h_g  = unpacked["lig_h"][mask_lig]
-            poc_x_g  = unpacked["poc_x"][mask_poc]
             poc_h_g  = unpacked["poc_h"][mask_poc]
 
             # Remap edge indices to per-graph local space
@@ -145,10 +146,8 @@ class FlowMatcher(nn.Module):
                 poc_offset=mask_poc.nonzero(as_tuple=True)[0].min().item(),
             )
 
-            t_g = t_per_graph[g]
-
             v_g = self.model(
-                lig_x=lig_x_g, lig_h=lig_h_g,
+                lig_x=x_t_g, lig_h=lig_h_g,
                 poc_x=poc_x_g, poc_h=poc_h_g,
                 lig_edge_index=lig_ei_g, lig_edge_attr=lig_ea_g,
                 poc_edge_index=poc_ei_g, poc_edge_attr=poc_ea_g,
@@ -157,7 +156,8 @@ class FlowMatcher(nn.Module):
             )
             v_pred_list.append(v_g)
 
-        v_pred = torch.cat(v_pred_list, dim=0)  # [N_total, 3]
+        v_pred = torch.cat(v_pred_list, dim=0)   # [N_total, 3]
+        target = torch.cat(target_list,  dim=0)   # [N_total, 3]
         loss   = nn.functional.mse_loss(v_pred, target)
         return loss
 
@@ -203,6 +203,10 @@ class FlowMatcher(nn.Module):
             poc_x_g  = unpacked["poc_x"][mask_poc]
             poc_h_g  = unpacked["poc_h"][mask_poc]
 
+            # Center on pocket centroid (matches the centering done during training)
+            poc_center = poc_x_g.mean(0, keepdim=True)   # [1, 3]
+            poc_x_g    = poc_x_g - poc_center
+
             lig_ei_g, lig_ea_g = _extract_subgraph_edges(
                 unpacked["lig_edge_index"], unpacked["lig_edge_attr"],
                 mask_lig, offset=mask_lig.nonzero(as_tuple=True)[0].min().item()
@@ -218,7 +222,7 @@ class FlowMatcher(nn.Module):
                 poc_offset=mask_poc.nonzero(as_tuple=True)[0].min().item(),
             )
 
-            # Start from Gaussian noise
+            # Start from Gaussian noise in centered pocket space
             x = torch.randn(mask_lig.sum().item(), 3, device=device)
 
             for step in range(n_steps):

@@ -53,7 +53,10 @@ def kabsch_rmsd(P: Tensor, Q: Tensor) -> float:
     try:
         U, S, Vt = torch.linalg.svd(H)
         d = torch.linalg.det(Vt.T @ U.T)
-        D = torch.diag(torch.tensor([1.0, 1.0, d.sign()], device=P.device))
+        # d.sign() == 0 (degenerate SVD) would make D singular → NaN RMSD;
+        # treat as +1 (proper rotation) in that case.
+        sign_d = d.sign() if d.abs() > 1e-8 else torch.ones(1, device=P.device).squeeze()
+        D = torch.diag(torch.tensor([1.0, 1.0, sign_d.item()], device=P.device))
         R = Vt.T @ D @ U.T
         P_rot = Pc @ R.T
     except torch._C._LinAlgError:
