@@ -35,7 +35,7 @@ class PDBBindDataset(Dataset):
 
     def __init__(self, processed_dir: str, complex_ids: List[str]):
         super().__init__()
-        self.processed_dir = processed_dir
+        self._data_dir = processed_dir  # avoid collision with PyG's processed_dir property
         self.complex_ids = [
             cid for cid in complex_ids
             if os.path.exists(os.path.join(processed_dir, f"{cid}.pt"))
@@ -46,7 +46,7 @@ class PDBBindDataset(Dataset):
 
     def get(self, idx: int) -> HeteroData:
         cid = self.complex_ids[idx]
-        path = os.path.join(self.processed_dir, f"{cid}.pt")
+        path = os.path.join(self._data_dir, f"{cid}.pt")
         data = torch.load(path, weights_only=False)
         return data
 
