@@ -182,11 +182,15 @@ class EGNNFlowModel(nn.Module):
             EGNNLayer(hidden_dim, hidden_dim) for _ in range(n_layers)
         ])
 
-        # Output head: project ligand hidden states → velocity (3D)
-        self.out_head = nn.Sequential(
+        # Output scale: invariant scalar per atom that weights the
+        # equivariant coordinate displacement → velocity.
+        # v = out_scale(h) * (x_updated - x_input)
+        # This keeps the output equivariant: h is invariant, so scale is
+        # invariant; (x_updated - x_input) is equivariant; product is equivariant.
+        self.out_scale = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(
@@ -217,6 +221,7 @@ class EGNNFlowModel(nn.Module):
         # Combine into a single node tensor [N_lig + M_poc, D]
         h = torch.cat([h_lig, h_poc], dim=0)
         x = torch.cat([lig_x, poc_x], dim=0)
+        x_input = x.clone()  # save input coords — velocity = x_updated - x_input
 
         # Build combined edge index — shift pocket indices to combined space
         # Ligand edges: indices already in [0, N_lig)
@@ -248,8 +253,13 @@ class EGNNFlowModel(nn.Module):
         for layer in self.layers:
             h, x = layer(h, x, combined_ei, combined_attr, fixed_mask)
 
-        # Project ligand node states to velocity
-        v = self.out_head(h[:N_lig])  # [N_lig, 3]
+        # Equivariant velocity output:
+        #   coord_displacement = x_updated - x_input  → equivariant (rotates with input)
+        #   scale              = out_scale(h)          → invariant scalar
+        #   v                  = scale * displacement  → equivariant
+        coord_displacement = x[:N_lig] - x_input[:N_lig]   # [N_lig, 3]
+        scale = self.out_scale(h[:N_lig])                   # [N_lig, 1]
+        v = scale * coord_displacement                       # [N_lig, 3]
         return v
 
 
