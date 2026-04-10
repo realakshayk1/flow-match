@@ -48,7 +48,36 @@ class PDBBindDataset(Dataset):
         cid = self.complex_ids[idx]
         path = os.path.join(self._data_dir, f"{cid}.pt")
         data = torch.load(path, weights_only=False)
-        return data
+        return _move_edges_to_edge_stores(data)
+
+
+def _move_edges_to_edge_stores(data: HeteroData) -> HeteroData:
+    """
+    PyG 2.5.x: edge_index stored in NodeStorage (e.g. data['ligand'].edge_index)
+    is collated along dim=0 instead of the correct dim=1, causing a RuntimeError
+    when molecules with different edge counts are batched together.
+
+    Fix: move ligand and pocket intra-edges from NodeStorage into proper
+    EdgeStorage types. EdgeStorage always uses cat_dim=1 for edge_index.
+    Cross edges (pocket→ligand) are already in EdgeStorage — no change needed.
+
+    This is done at load time so no reprocessing of .pt files is required.
+    """
+    # Ligand intra-edges: NodeStorage → EdgeStorage
+    if hasattr(data['ligand'], 'edge_index'):
+        data['ligand', 'bond', 'ligand'].edge_index = data['ligand'].edge_index
+        data['ligand', 'bond', 'ligand'].edge_attr  = data['ligand'].edge_attr
+        del data['ligand'].edge_index
+        del data['ligand'].edge_attr
+
+    # Pocket intra-edges: NodeStorage → EdgeStorage
+    if hasattr(data['pocket'], 'edge_index'):
+        data['pocket', 'bond', 'pocket'].edge_index = data['pocket'].edge_index
+        data['pocket', 'bond', 'pocket'].edge_attr  = data['pocket'].edge_attr
+        del data['pocket'].edge_index
+        del data['pocket'].edge_attr
+
+    return data
 
 
 def make_dataloader(
@@ -67,7 +96,6 @@ def make_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        follow_batch=["ligand__pos"],
     )
 
 
