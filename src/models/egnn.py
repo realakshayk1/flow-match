@@ -99,6 +99,12 @@ class EGNNLayer(nn.Module):
             coord_delta,
         )
 
+        # Normalise by in-degree so nodes with more neighbours don't accumulate
+        # proportionally larger updates (standard EGNN practice, Satorras et al.).
+        in_degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+        in_degree.scatter_add_(0, dst, torch.ones(dst.size(0), device=x.device, dtype=x.dtype))
+        coord_agg = coord_agg / in_degree.clamp(min=1.0).unsqueeze(-1)
+
         # Mask out pocket atom coordinate updates
         if fixed_mask is not None:
             update_mask = (~fixed_mask).float().unsqueeze(-1)  # [N, 1]

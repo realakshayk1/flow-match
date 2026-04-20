@@ -203,8 +203,12 @@ class FlowMatcher(nn.Module):
             x = x + dt * v
             x = _clamp_update(x, x_prev, max_delta=5.0)
 
-        # Split back into per-molecule tensors
-        return [x[lig_batch == g] for g in range(n_graphs)]
+        # Shift back to the original (un-centered) coordinate frame so that
+        # returned coordinates are in the same space as the crystal positions.
+        # Kabsch RMSD is translation-invariant so validation metrics are correct
+        # either way, but downstream use (e.g. saving to PDB) requires the
+        # original frame.
+        return [x[lig_batch == g] + poc_center[g] for g in range(n_graphs)]
 
     # ------------------------------------------------------------------
     # Single-molecule generate (convenience)
