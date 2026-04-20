@@ -128,7 +128,7 @@ def train_epoch(
 
     for batch in loader:
         batch = batch.to(device)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         loss = flow_matcher.compute_loss(batch)
         loss.backward()
@@ -147,12 +147,20 @@ def val_epoch(
     flow_matcher: FlowMatcher,
     loader,
     device: torch.device,
+    inference_steps: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """Validation epoch. Returns (mean_val_loss, median_rmsd)."""
+    """Validation epoch. Returns (mean_val_loss, median_rmsd).
+
+    inference_steps: Euler steps to use during validation (default: flow_matcher.n_steps).
+        Use a smaller value (e.g. 5) for faster epoch-level validation; the full step
+        count is reserved for final test evaluation.
+    """
     flow_matcher.eval()
     total_loss = 0.0
     n_batches = 0
     rmsd_list = []
+
+    n_steps = inference_steps if inference_steps is not None else flow_matcher.n_steps
 
     for batch in loader:
         batch = batch.to(device)
@@ -161,10 +169,10 @@ def val_epoch(
         n_batches += 1
 
         # Generate one sample per molecule and compute RMSD
-        generated = flow_matcher.generate(batch, n_steps=flow_matcher.n_steps)
+        generated = flow_matcher.generate(batch, n_steps=n_steps)
         lig_batch = batch["ligand"].batch
         crystal_pos = batch["ligand"].pos
-        n_graphs = lig_batch.max().item() + 1
+        n_graphs = int(lig_batch.max().item()) + 1
 
         for g in range(n_graphs):
             mask = lig_batch == g
@@ -192,9 +200,10 @@ def train(config: argparse.Namespace):
     val_ds   = PDBBindDataset(config.processed_dir, splits["val"])
     test_ds  = PDBBindDataset(config.processed_dir, splits["test"])
 
-    train_loader = make_dataloader(train_ds, batch_size=config.batch_size, shuffle=True)
-    val_loader   = make_dataloader(val_ds,   batch_size=config.batch_size, shuffle=False)
-    test_loader  = make_dataloader(test_ds,  batch_size=config.batch_size, shuffle=False)
+    pin = device.type == "cuda"
+    train_loader = make_dataloader(train_ds, batch_size=config.batch_size, shuffle=True,  pin_memory=pin)
+    val_loader   = make_dataloader(val_ds,   batch_size=config.batch_size, shuffle=False, pin_memory=pin)
+    test_loader  = make_dataloader(test_ds,  batch_size=config.batch_size, shuffle=False, pin_memory=pin)
 
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
@@ -229,39 +238,52 @@ def train(config: argparse.Namespace):
 
     for epoch in range(1, config.n_epochs + 1):
         train_loss = train_epoch(flow_matcher, train_loader, optimizer, device)
-        val_loss, val_rmsd = val_epoch(flow_matcher, val_loader, device)
         scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
 
-        print(
-            f"Epoch {epoch:3d}/{config.n_epochs} | "
-            f"train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | "
-            f"val_rmsd={val_rmsd:.3f} Å | "
-            f"lr={current_lr:.2e}"
-        )
+        # Run full validation only every val_freq epochs; skip generate on off-epochs.
+        do_val = (epoch % config.val_freq == 0) or (epoch == config.n_epochs)
+        if do_val:
+            val_loss, val_rmsd = val_epoch(
+                flow_matcher, val_loader, device,
+                inference_steps=config.val_inference_steps,
+            )
+            print(
+                f"Epoch {epoch:3d}/{config.n_epochs} | "
+                f"train_loss={train_loss:.4f} | "
+                f"val_loss={val_loss:.4f} | "
+                f"val_rmsd={val_rmsd:.3f} Å | "
+                f"lr={current_lr:.2e}"
+            )
+        else:
+            val_loss, val_rmsd = float("nan"), float("nan")
+            print(
+                f"Epoch {epoch:3d}/{config.n_epochs} | "
+                f"train_loss={train_loss:.4f} | "
+                f"(val skipped) | "
+                f"lr={current_lr:.2e}"
+            )
 
         if WANDB_AVAILABLE and config.wandb_project:
-            wandb.log({
-                "epoch":       epoch,
-                "train/loss":  train_loss,
-                "val/loss":    val_loss,
-                "val/rmsd_median": val_rmsd,
-                "lr":          current_lr,
-            })
+            log_dict = {"epoch": epoch, "train/loss": train_loss, "lr": current_lr}
+            if do_val:
+                log_dict["val/loss"] = val_loss
+                log_dict["val/rmsd_median"] = val_rmsd
+            wandb.log(log_dict)
 
-        # Early stopping on val RMSD
-        if val_rmsd < best_val_rmsd:
-            best_val_rmsd = val_rmsd
-            patience_count = 0
-            save_checkpoint(best_ckpt_path, model, optimizer, epoch, val_rmsd)
-            print(f"  ✓ New best val RMSD: {val_rmsd:.3f} Å (saved checkpoint)")
-        else:
-            patience_count += 1
-            if patience_count >= config.patience:
-                print(f"Early stopping at epoch {epoch} (patience={config.patience})")
-                break
+        # Early stopping on val RMSD (only when we actually ran validation)
+        if do_val and not (val_rmsd != val_rmsd):  # not NaN
+            if val_rmsd < best_val_rmsd:
+                best_val_rmsd = val_rmsd
+                patience_count = 0
+                save_checkpoint(best_ckpt_path, model, optimizer, epoch, val_rmsd)
+                print(f"  ✓ New best val RMSD: {val_rmsd:.3f} Å (saved checkpoint)")
+            else:
+                patience_count += 1
+                if patience_count >= config.patience:
+                    print(f"Early stopping at epoch {epoch} (patience={config.patience})")
+                    break
 
     print(f"\nBest val RMSD: {best_val_rmsd:.3f} Å")
 
@@ -300,7 +322,12 @@ def parse_args():
     p.add_argument("--lr",               type=float, default=3e-4)
     p.add_argument("--n_epochs",         type=int,   default=100)
     p.add_argument("--patience",         type=int,   default=15)
-    p.add_argument("--n_inference_steps", type=int,  default=20)
+    p.add_argument("--n_inference_steps",    type=int,  default=20)
+    p.add_argument("--val_inference_steps",  type=int,  default=5,
+                   help="Euler steps used during epoch validation (fewer = faster). "
+                        "Full n_inference_steps used only for final test eval.")
+    p.add_argument("--val_freq",             type=int,  default=1,
+                   help="Run validation every N epochs (1=every epoch, 5=every 5th).")
     p.add_argument("--checkpoint_dir",   default="checkpoints")
     p.add_argument("--wandb_project",    default="")
     p.add_argument("--device",           default="auto",

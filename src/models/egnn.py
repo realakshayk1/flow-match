@@ -210,10 +210,12 @@ class EGNNFlowModel(nn.Module):
         N_lig = lig_h.size(0)
         M_poc = poc_h.size(0)
 
-        # Embed time into ligand features
-        if t.dim() == 0:
-            t = t.unsqueeze(0)
-        t_feat = t.expand(N_lig, 1)  # [N_lig, 1]
+        # Embed time into ligand features.
+        # t may be scalar, [1], [N_lig] (per-atom for batched training), or [N_lig, 1].
+        if t.dim() == 0 or t.numel() == 1:
+            t_feat = t.reshape(1, 1).expand(N_lig, 1)  # [N_lig, 1]
+        else:
+            t_feat = t.reshape(-1, 1)  # [N_lig, 1]
 
         h_lig = self.lig_emb(torch.cat([lig_h, t_feat], dim=-1))  # [N_lig, D]
         h_poc = self.poc_emb(poc_h)                                  # [M_poc, D]
