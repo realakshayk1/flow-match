@@ -140,6 +140,10 @@ def process_one(args_tuple) -> dict:
 
         data.complex_id = pdb_id
         data.smiles = Chem.MolToSmiles(mol)
+        data.ligand_meta_canonical_smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
+        data.ligand_meta_atom_count = mol.GetNumAtoms()
+        data.ligand_meta_heavy_atom_count = mol.GetNumHeavyAtoms()
+        data.ligand_meta_ordered_symbols = ",".join([a.GetSymbol() for a in mol.GetAtoms()])
 
         # Save
         out_path = os.path.join(out_dir, f"{pdb_id}.pt")

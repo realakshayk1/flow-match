@@ -303,63 +303,65 @@ def train(config: argparse.Namespace):
         wandb.init(project=config.wandb_project, config=vars(config))
 
     # --- Training loop ---
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
-    best_val_rmsd = float("inf")
-    patience_count = 0
-    best_ckpt_path = os.path.join(config.checkpoint_dir, "best_model.pt")
+    best_ckpt_path = config.resume_checkpoint if config.resume_checkpoint else os.path.join(config.checkpoint_dir, "best_model.pt")
 
-    for epoch in range(1, config.n_epochs + 1):
-        train_loss = train_epoch(
-            flow_matcher, train_loader, optimizer, device,
-            use_amp=use_amp, amp_dtype=amp_torch_dtype, scaler=scaler,
-        )
-        scheduler.step()
+    if not config.eval_only:
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
+        best_val_rmsd = float("inf")
+        patience_count = 0
 
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        do_val = (epoch % config.val_freq == 0) or (epoch == config.n_epochs)
-        if do_val:
-            val_loss, val_rmsd = val_epoch(
-                flow_matcher, val_loader, device,
-                inference_steps=config.val_inference_steps,
-                use_amp=use_amp, amp_dtype=amp_torch_dtype,
+        for epoch in range(1, config.n_epochs + 1):
+            train_loss = train_epoch(
+                flow_matcher, train_loader, optimizer, device,
+                use_amp=use_amp, amp_dtype=amp_torch_dtype, scaler=scaler,
             )
-            print(
-                f"Epoch {epoch:3d}/{config.n_epochs} | "
-                f"train_loss={train_loss:.4f} | "
-                f"val_loss={val_loss:.4f} | "
-                f"val_rmsd={val_rmsd:.3f} Å | "
-                f"lr={current_lr:.2e}"
-            )
-        else:
-            val_loss, val_rmsd = float("nan"), float("nan")
-            print(
-                f"Epoch {epoch:3d}/{config.n_epochs} | "
-                f"train_loss={train_loss:.4f} | "
-                f"(val skipped) | "
-                f"lr={current_lr:.2e}"
-            )
+            scheduler.step()
 
-        if WANDB_AVAILABLE and config.wandb_project:
-            log_dict = {"epoch": epoch, "train/loss": train_loss, "lr": current_lr}
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            do_val = (epoch % config.val_freq == 0) or (epoch == config.n_epochs)
             if do_val:
-                log_dict["val/loss"] = val_loss
-                log_dict["val/rmsd_median"] = val_rmsd
-            wandb.log(log_dict)
-
-        if do_val and not (val_rmsd != val_rmsd):  # not NaN
-            if val_rmsd < best_val_rmsd:
-                best_val_rmsd = val_rmsd
-                patience_count = 0
-                save_checkpoint(best_ckpt_path, model, optimizer, epoch, val_rmsd, config)
-                print(f"  ✓ New best val RMSD: {val_rmsd:.3f} Å (saved checkpoint)")
+                val_loss, val_rmsd = val_epoch(
+                    flow_matcher, val_loader, device,
+                    inference_steps=config.val_inference_steps,
+                    use_amp=use_amp, amp_dtype=amp_torch_dtype,
+                )
+                print(
+                    f"Epoch {epoch:3d}/{config.n_epochs} | "
+                    f"train_loss={train_loss:.4f} | "
+                    f"val_loss={val_loss:.4f} | "
+                    f"val_rmsd={val_rmsd:.3f} Å | "
+                    f"lr={current_lr:.2e}"
+                )
             else:
-                patience_count += 1
-                if patience_count >= config.patience:
-                    print(f"Early stopping at epoch {epoch} (patience={config.patience})")
-                    break
+                val_loss, val_rmsd = float("nan"), float("nan")
+                print(
+                    f"Epoch {epoch:3d}/{config.n_epochs} | "
+                    f"train_loss={train_loss:.4f} | "
+                    f"(val skipped) | "
+                    f"lr={current_lr:.2e}"
+                )
 
-    print(f"\nBest val RMSD: {best_val_rmsd:.3f} Å")
+            if WANDB_AVAILABLE and config.wandb_project:
+                log_dict = {"epoch": epoch, "train/loss": train_loss, "lr": current_lr}
+                if do_val:
+                    log_dict["val/loss"] = val_loss
+                    log_dict["val/rmsd_median"] = val_rmsd
+                wandb.log(log_dict)
+
+            if do_val and not (val_rmsd != val_rmsd):  # not NaN
+                if val_rmsd < best_val_rmsd:
+                    best_val_rmsd = val_rmsd
+                    patience_count = 0
+                    save_checkpoint(best_ckpt_path, model, optimizer, epoch, val_rmsd, config)
+                    print(f"  ✓ New best val RMSD: {val_rmsd:.3f} Å (saved checkpoint)")
+                else:
+                    patience_count += 1
+                    if patience_count >= config.patience:
+                        print(f"Early stopping at epoch {epoch} (patience={config.patience})")
+                        break
+
+        print(f"\nBest val RMSD: {best_val_rmsd:.3f} Å")
 
     # --- Test evaluation ---
     if os.path.exists(best_ckpt_path):
@@ -367,14 +369,19 @@ def train(config: argparse.Namespace):
     flow_matcher.eval()
 
     test_metrics = compute_test_metrics(flow_matcher, test_loader, device)
-    print("\n=== Test Metrics ===")
+    print("\n=== Test Metrics (Resume-safe) ===")
     print(f"RMSD median:   {test_metrics['rmsd_median']:.3f} Å")
     print(f"RMSD mean:     {test_metrics['rmsd_mean']:.3f} Å")
     print(f"RMSD < 1 Å:    {test_metrics['rmsd_pct_under_1A']:.1f}%")
     print(f"RMSD < 2 Å:    {test_metrics['rmsd_pct_under_2A']:.1f}%")
     print(f"RMSD < 5 Å:    {test_metrics['rmsd_pct_under_5A']:.1f}%")
-    print(f"Strain median: {test_metrics['strain_median']:.3f}")
-    print(f"MMFF failures: {test_metrics['n_mmff_failed']} / {test_metrics['n_total']}")
+    print("\n=== Chemistry Metrics (Experimental) ===")
+    print(f"Strain median:         {test_metrics['strain_median']:.3f}")
+    failures = test_metrics.get('strain_failures', {})
+    print(f"Invalid geometry:      {failures.get('invalid_pose_geometry', 0)}")
+    print(f"RDKit/MMFF setup fail: {failures.get('rdkit_mmff_setup_failure', 0)}")
+    print(f"Absurd energy (>10k):  {failures.get('absurd_energy', 0)}")
+    print(f"Other failures:        {failures.get('other', 0)}")
 
     if WANDB_AVAILABLE and config.wandb_project:
         wandb.log({f"test/{k}": v for k, v in test_metrics.items()
@@ -392,13 +399,14 @@ def train(config: argparse.Namespace):
         print(f"\nComputing ETKDG baseline on {len(mol_lookup)} molecules ...")
         etkdg_metrics = compute_etkdg_baseline(test_loader, mol_lookup)
         improvement = etkdg_metrics["rmsd_median"] - test_metrics["rmsd_median"]
-        print("\n=== ETKDG Baseline (no pocket knowledge) ===")
+        print("\n=== ETKDG Baseline (Experimental) ===")
         print(f"RMSD median:   {etkdg_metrics['rmsd_median']:.3f} Å")
         print(f"RMSD mean:     {etkdg_metrics['rmsd_mean']:.3f} Å")
         print(f"RMSD < 1 Å:    {etkdg_metrics['rmsd_pct_under_1A']:.1f}%")
         print(f"RMSD < 2 Å:    {etkdg_metrics['rmsd_pct_under_2A']:.1f}%")
         print(f"RMSD < 5 Å:    {etkdg_metrics['rmsd_pct_under_5A']:.1f}%")
-        print(f"\nModel is {improvement:.3f} Å better median RMSD than ETKDG baseline")
+        print(f"\Failures breakdown: {etkdg_metrics.get('failures', {})}")
+        print(f"Model is {improvement:.3f} Å better median RMSD than ETKDG baseline")
 
         if WANDB_AVAILABLE and config.wandb_project:
             wandb.log({f"etkdg/{k}": v for k, v in etkdg_metrics.items()
@@ -441,6 +449,8 @@ def parse_args():
     p.add_argument("--val_freq",        type=int, default=1)
     p.add_argument("--checkpoint_dir",  default="checkpoints")
     p.add_argument("--wandb_project",   default="")
+    p.add_argument("--eval_only",       action="store_true")
+    p.add_argument("--resume_checkpoint", default=None, type=str)
 
     args = p.parse_args()
 

@@ -10,11 +10,12 @@ Evaluation metrics for 3D ligand conformation generation.
   - compute_etkdg_baseline: ETKDG baseline metrics
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
+from scipy.spatial.distance import pdist
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -40,6 +41,9 @@ def kabsch_rmsd(P: Tensor, Q: Tensor) -> float:
     Returns:
         RMSD in Angstroms (float)
     """
+    if P.shape[0] != Q.shape[0]:
+        return float("nan")
+
     P = P.float()
     Q = Q.float()
 
@@ -72,24 +76,36 @@ def kabsch_rmsd(P: Tensor, Q: Tensor) -> float:
 # MMFF94 energy
 # ---------------------------------------------------------------------------
 
-def mmff94_energy(mol: Chem.Mol, coords: np.ndarray) -> Optional[float]:
+def mmff94_energy(mol: Chem.Mol, coords: np.ndarray) -> Tuple[Optional[float], Optional[str]]:
     """
     Compute MMFF94 energy for mol with the given 3D coordinates.
 
     This is a score-only computation (no minimization).
-    Returns energy in kcal/mol, or None if MMFF94 fails.
-
-    Args:
-        mol:    RDKit mol (without Hs — Hs will be added internally)
-        coords: numpy [N, 3] coordinates for the heavy atoms
+    Returns (energy in kcal/mol, failure_reason).
     """
+    # 1. Reject invalid geometry
+    if coords.shape[0] != mol.GetNumAtoms():
+        return None, "invalid_pose_geometry: atom_count_mismatch"
+    if not np.isfinite(coords).all():
+        return None, "invalid_pose_geometry: non_finite_coords"
+    if np.abs(coords).max() > 1000.0:
+        return None, "invalid_pose_geometry: absurd_magnitude_coords"
+    
+    # Check for severe clashes
+    if coords.shape[0] > 1:
+        dists = pdist(coords)
+        if dists.min() < 0.4:
+            return None, "invalid_pose_geometry: severe_clash"
+
     try:
         mol_h = Chem.AddHs(mol)
         conf = mol_h.GetConformer() if mol_h.GetNumConformers() > 0 else None
 
         # Embed with ETKDG to get a starting conformer for Hs, then replace heavy coords
         if conf is None:
-            AllChem.EmbedMolecule(mol_h, randomSeed=42)
+            ret = AllChem.EmbedMolecule(mol_h, randomSeed=42)
+            if ret != 0:
+                return None, "rdkit_mmff_setup_failure: embed_molecule_failed"
 
         # Set heavy atom positions
         conf = mol_h.GetConformer()
@@ -103,52 +119,66 @@ def mmff94_energy(mol: Chem.Mol, coords: np.ndarray) -> Optional[float]:
             mol_h, AllChem.MMFFGetMoleculeProperties(mol_h)
         )
         if ff is None:
-            return None
-        return ff.CalcEnergy()
-    except Exception:
-        return None
+            return None, "rdkit_mmff_setup_failure: get_force_field_failed"
+        
+        energy = ff.CalcEnergy()
+        if energy > 10000.0:
+            return energy, "absurd_energy: >10000_kcal_mol"
+        return energy, None
+    except Exception as e:
+        return None, f"rdkit_mmff_setup_failure: exception_{str(e)[:50]}"
 
 
-def etkdg_energy(mol: Chem.Mol, seed: int = 42) -> Optional[float]:
+def etkdg_energy(mol: Chem.Mol, seed: int = 42) -> Tuple[Optional[float], Optional[str]]:
     """
     Generate an ETKDG conformer and compute its MMFF94 energy.
-
-    Used as the baseline strain energy. Seed=42 for reproducibility.
-
-    Returns energy in kcal/mol, or None on failure.
+    Returns (energy in kcal/mol, failure_reason)
     """
     try:
         mol_h = Chem.AddHs(mol)
         ret = AllChem.EmbedMolecule(mol_h, randomSeed=seed)
         if ret != 0:
-            return None
+            return None, "rdkit_mmff_setup_failure: embed_molecule_failed"
         AllChem.MMFFOptimizeMolecule(mol_h)
         ff = AllChem.MMFFGetMoleculeForceField(
             mol_h, AllChem.MMFFGetMoleculeProperties(mol_h)
         )
         if ff is None:
-            return None
-        return ff.CalcEnergy()
-    except Exception:
-        return None
+            return None, "rdkit_mmff_setup_failure: get_force_field_failed"
+        
+        energy = ff.CalcEnergy()
+        if energy > 10000.0:
+            return energy, "absurd_energy: >10000_kcal_mol"
+        return energy, None
+    except Exception as e:
+        return None, f"rdkit_mmff_setup_failure: exception_{str(e)[:50]}"
 
 
 def strain_energy_ratio(
     mol: Chem.Mol,
     generated_coords: np.ndarray,
-) -> Optional[float]:
+) -> Tuple[Optional[float], Optional[str]]:
     """
     Compute E_generated / E_etkdg strain energy ratio.
-
-    Returns None if either energy computation fails.
+    Returns (ratio, failure_reason).
     """
-    e_gen  = mmff94_energy(mol, generated_coords)
-    e_etkdg = etkdg_energy(mol)
-    if e_gen is None or e_etkdg is None:
-        return None
+    e_gen, gen_reason  = mmff94_energy(mol, generated_coords)
+    e_etkdg, etkdg_reason = etkdg_energy(mol)
+    
+    if e_gen is None:
+        return None, f"gen_{gen_reason}"
+    if e_etkdg is None:
+        return None, f"etkdg_{etkdg_reason}"
+    
     if abs(e_etkdg) < 1e-6:
-        return None   # degenerate baseline
-    return e_gen / e_etkdg
+        return None, "degenerate_baseline_energy_near_zero"
+    
+    ratio = e_gen / e_etkdg
+    reason = None
+    if gen_reason and "absurd_energy" in gen_reason:
+        reason = "absurd_energy"
+        
+    return ratio, reason
 
 
 # ---------------------------------------------------------------------------
@@ -158,13 +188,6 @@ def strain_energy_ratio(
 def mol_with_coords(mol: Chem.Mol, coords: np.ndarray) -> Chem.Mol:
     """
     Return a new RDKit mol with a conformer set to the given coordinates.
-
-    Args:
-        mol:    original RDKit mol (no conformer required)
-        coords: numpy [N, 3] for N heavy atoms
-
-    Returns:
-        new mol with one conformer at the given positions
     """
     mol_new = Chem.RWMol(mol)
     conf = Chem.Conformer(mol_new.GetNumAtoms())
@@ -186,24 +209,6 @@ def compute_test_metrics(
 ) -> Dict:
     """
     Run full evaluation on a test DataLoader.
-
-    For each molecule:
-      - Generate n_samples conformations
-      - Compute Kabsch RMSD vs crystal for the best sample
-      - Compute strain energy ratio
-
-    Returns dict with:
-        rmsd_all              List[float] — per-molecule RMSD
-        rmsd_median           float
-        rmsd_mean             float
-        rmsd_pct_under_1A     float  (%)
-        rmsd_pct_under_2A     float  (%)
-        rmsd_pct_under_5A     float  (%)
-        strain_all            List[Optional[float]]
-        strain_median         float  (excludes None)
-        strain_mean           float  (excludes None)
-        n_mmff_failed         int
-        n_total               int
     """
     import sys
     sys.path.insert(0, ".")
@@ -211,6 +216,12 @@ def compute_test_metrics(
     flow_matcher.eval()
     rmsd_all = []
     strain_all = []
+    strain_failures = {
+        "invalid_pose_geometry": 0,
+        "rdkit_mmff_setup_failure": 0,
+        "absurd_energy": 0,
+        "other": 0
+    }
 
     for batch in test_loader:
         batch = batch.to(device)
@@ -222,8 +233,7 @@ def compute_test_metrics(
         generated = flow_matcher.generate(batch, n_steps=flow_matcher.n_steps)
 
         # SMILES stored per-graph in HeteroData (added by preprocess.py).
-        # PyG collates string attributes into a list when batching.
-        smiles_list = batch.smiles if hasattr(batch, "smiles") else None
+        smiles_list = batch.ligand_meta_canonical_smiles if hasattr(batch, "ligand_meta_canonical_smiles") else (batch.smiles if hasattr(batch, "smiles") else None)
         if isinstance(smiles_list, str):
             smiles_list = [smiles_list]
 
@@ -240,39 +250,66 @@ def compute_test_metrics(
             if smiles_list is not None and g < len(smiles_list):
                 mol = Chem.MolFromSmiles(smiles_list[g])
                 if mol is not None:
-                    strain = strain_energy_ratio(mol, gen_g.numpy())
+                    # Sanity check against preprocessing metadata if available
+                    metadata_match = True
+                    if hasattr(batch, "ligand_meta_atom_count"):
+                        meta_count = batch.ligand_meta_atom_count[g] if isinstance(batch.ligand_meta_atom_count, list) else batch.ligand_meta_atom_count
+                        if mol.GetNumAtoms() != meta_count:
+                            metadata_match = False
+                    
+                    if metadata_match:
+                        strain, reason = strain_energy_ratio(mol, gen_g.numpy())
+                        if reason is not None:
+                            if "invalid_pose_geometry" in reason:
+                                strain_failures["invalid_pose_geometry"] += 1
+                            elif "rdkit_mmff_setup_failure" in reason:
+                                strain_failures["rdkit_mmff_setup_failure"] += 1
+                            elif "absurd_energy" in reason:
+                                strain_failures["absurd_energy"] += 1
+                            else:
+                                strain_failures["other"] += 1
             strain_all.append(strain)
 
     rmsd_arr = np.array(rmsd_all)
     valid_strains = [s for s in strain_all if s is not None]
 
+    n_total_strain_attempted = sum(strain_failures.values()) + len(valid_strains)
+
     return {
         "rmsd_all":          rmsd_all,
-        "rmsd_median":       float(np.median(rmsd_arr)),
-        "rmsd_mean":         float(np.mean(rmsd_arr)),
-        "rmsd_pct_under_1A": float((rmsd_arr < 1.0).mean() * 100),
-        "rmsd_pct_under_2A": float((rmsd_arr < 2.0).mean() * 100),
-        "rmsd_pct_under_5A": float((rmsd_arr < 5.0).mean() * 100),
+        "rmsd_median":       float(np.median(rmsd_arr)) if len(rmsd_arr) else float("nan"),
+        "rmsd_mean":         float(np.mean(rmsd_arr)) if len(rmsd_arr) else float("nan"),
+        "rmsd_pct_under_1A": float((rmsd_arr < 1.0).mean() * 100) if len(rmsd_arr) else 0.0,
+        "rmsd_pct_under_2A": float((rmsd_arr < 2.0).mean() * 100) if len(rmsd_arr) else 0.0,
+        "rmsd_pct_under_5A": float((rmsd_arr < 5.0).mean() * 100) if len(rmsd_arr) else 0.0,
         "strain_all":        strain_all,
         "strain_median":     float(np.median(valid_strains)) if valid_strains else float("nan"),
         "strain_mean":       float(np.mean(valid_strains)) if valid_strains else float("nan"),
-        "n_mmff_failed":     strain_all.count(None),
+        "n_mmff_failed":     len(strain_all) - len(valid_strains) - strain_failures.get("absurd_energy", 0),
         "n_total":           len(rmsd_all),
+        "strain_failures":   strain_failures
     }
 
 
 def compute_etkdg_baseline(test_loader, mol_lookup: Dict) -> Dict:
     """
     Compute ETKDG baseline metrics.
-
-    Args:
-        test_loader: DataLoader over test set
-        mol_lookup:  dict mapping complex_id → RDKit mol (with crystal conformer)
-
-    Returns same structure as compute_test_metrics.
     """
     rmsd_all = []
     strain_all = []
+    failures = {
+        "n_success": 0,
+        "n_atom_mismatch": 0,
+        "n_embed_fail": 0,
+        "n_other_fail": 0
+    }
+    
+    strain_failures = {
+        "invalid_pose_geometry": 0,
+        "rdkit_mmff_setup_failure": 0,
+        "absurd_energy": 0,
+        "other": 0
+    }
 
     for batch in test_loader:
         # batch.complex_id is a list of strings in a batched HeteroData
@@ -284,25 +321,47 @@ def compute_etkdg_baseline(test_loader, mol_lookup: Dict) -> Dict:
         for cid, crystal_pos in zip(ids, crystal_pos_list):
             mol = mol_lookup.get(cid)
             if mol is None:
+                failures["n_other_fail"] += 1
                 continue
 
-            mol_h = Chem.AddHs(mol)
-            ret = AllChem.EmbedMolecule(mol_h, randomSeed=42)
-            if ret != 0:
-                rmsd_all.append(float("nan"))
-                strain_all.append(None)
+            if mol.GetNumAtoms() != crystal_pos.shape[0]:
+                failures["n_atom_mismatch"] += 1
                 continue
 
-            AllChem.MMFFOptimizeMolecule(mol_h)
-            mol_h = Chem.RemoveHs(mol_h)
-            etkdg_pos = torch.tensor(
-                mol_h.GetConformer().GetPositions(), dtype=torch.float32
-            )
+            try:
+                mol_h = Chem.AddHs(mol)
+                ret = AllChem.EmbedMolecule(mol_h, randomSeed=42)
+                if ret != 0:
+                    failures["n_embed_fail"] += 1
+                    continue
+
+                AllChem.MMFFOptimizeMolecule(mol_h)
+                mol_h = Chem.RemoveHs(mol_h)
+                etkdg_pos = torch.tensor(
+                    mol_h.GetConformer().GetPositions(), dtype=torch.float32
+                )
+            except Exception:
+                failures["n_embed_fail"] += 1
+                continue
 
             rmsd = kabsch_rmsd(etkdg_pos, crystal_pos.cpu())
+            if np.isnan(rmsd):
+                failures["n_atom_mismatch"] += 1
+                continue
+                
             rmsd_all.append(rmsd)
+            failures["n_success"] += 1
 
-            ratio = strain_energy_ratio(mol, etkdg_pos.numpy())
+            ratio, reason = strain_energy_ratio(mol, etkdg_pos.numpy())
+            if reason is not None:
+                if "invalid_pose_geometry" in reason:
+                    strain_failures["invalid_pose_geometry"] += 1
+                elif "rdkit_mmff_setup_failure" in reason:
+                    strain_failures["rdkit_mmff_setup_failure"] += 1
+                elif "absurd_energy" in reason:
+                    strain_failures["absurd_energy"] += 1
+                else:
+                    strain_failures["other"] += 1
             strain_all.append(ratio)
 
     rmsd_arr = np.array([r for r in rmsd_all if not np.isnan(r)])
@@ -318,8 +377,10 @@ def compute_etkdg_baseline(test_loader, mol_lookup: Dict) -> Dict:
         "strain_all":        strain_all,
         "strain_median":     float(np.median(valid_strains)) if valid_strains else float("nan"),
         "strain_mean":       float(np.mean(valid_strains)) if valid_strains else float("nan"),
-        "n_mmff_failed":     strain_all.count(None),
+        "n_mmff_failed":     len(strain_all) - len(valid_strains) - strain_failures.get("absurd_energy", 0),
         "n_total":           len(rmsd_all),
+        "failures":          failures,
+        "strain_failures":   strain_failures
     }
 
 
