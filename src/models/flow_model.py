@@ -91,75 +91,50 @@ class FlowMatcher(nn.Module):
 
         Returns: scalar loss averaged over atoms.
         """
-        unpacked = self._unpack_batch(batch)
-        lig_x1   = unpacked["lig_x"]      # crystal coords: [N_total, 3]
-        lig_batch = unpacked["lig_batch"]  # [N_total] — which graph each atom belongs to
+        unpacked  = self._unpack_batch(batch)
+        lig_x1    = unpacked["lig_x"]      # [N_total, 3]
+        lig_batch = unpacked["lig_batch"]  # [N_total]
+        poc_batch = unpacked["poc_batch"]  # [M_total]
+        poc_x     = unpacked["poc_x"]      # [M_total, 3]
 
-        n_graphs = lig_batch.max().item() + 1
+        n_graphs = int(lig_batch.max().item()) + 1
         device   = lig_x1.device
 
-        # Sample t per molecule
-        t_per_graph = torch.rand(n_graphs, device=device)   # [n_graphs]
+        # Sample t per molecule, then expand to per-atom [N_total]
+        t_per_graph = torch.rand(n_graphs, device=device)
+        t_atom      = t_per_graph[lig_batch]               # [N_total]
 
-        # Run one forward pass per graph (different t per molecule requires this)
-        v_pred_list  = []
-        target_list  = []
+        # Vectorized pocket centering via scatter
+        poc_center = torch.zeros(n_graphs, 3, device=device)
+        poc_center.scatter_add_(
+            0, poc_batch.unsqueeze(1).expand_as(poc_x), poc_x
+        )
+        poc_count = poc_batch.bincount(minlength=n_graphs).float().unsqueeze(1)
+        poc_center = poc_center / poc_count                # [n_graphs, 3]
 
-        for g in range(n_graphs):
-            mask_lig = lig_batch == g
-            mask_poc = unpacked["poc_batch"] == g
+        poc_x_c  = poc_x   - poc_center[poc_batch]        # [M_total, 3]
+        lig_x1_c = lig_x1  - poc_center[lig_batch]        # [N_total, 3]
 
-            # Crystal ligand and pocket positions for this graph
-            lig_x1_g = lig_x1[mask_lig]                   # [N_lig, 3]
-            poc_x_g  = unpacked["poc_x"][mask_poc]         # [M_poc, 3]
+        # Sample x_0 ~ N(0, I) and interpolate to x_t
+        x0     = torch.randn_like(lig_x1_c)
+        t_col  = t_atom.unsqueeze(1)                       # [N_total, 1]
+        x_t    = (1.0 - t_col) * x0 + t_col * lig_x1_c   # [N_total, 3]
+        target = lig_x1_c - x0                             # [N_total, 3]
 
-            # Center on pocket centroid so that N(0,I) noise and pocket
-            # coordinates are in the same ~Angstrom-scale neighbourhood.
-            poc_center = poc_x_g.mean(0, keepdim=True)     # [1, 3]
-            lig_x1_g   = lig_x1_g - poc_center
-            poc_x_g    = poc_x_g  - poc_center
+        # Single batched forward pass — PyG has already offset edge indices
+        v_pred = self.model(
+            lig_x=x_t,                          lig_h=unpacked["lig_h"],
+            poc_x=poc_x_c,                      poc_h=unpacked["poc_h"],
+            lig_edge_index=unpacked["lig_edge_index"],
+            lig_edge_attr=unpacked["lig_edge_attr"],
+            poc_edge_index=unpacked["poc_edge_index"],
+            poc_edge_attr=unpacked["poc_edge_attr"],
+            cross_edge_index=unpacked["cross_edge_index"],
+            cross_edge_attr=unpacked["cross_edge_attr"],
+            t=t_atom,  # [N_total] per-atom time
+        )
 
-            # Sample x_0 ~ N(0, I) in centered space and interpolate
-            x0_g  = torch.randn_like(lig_x1_g)
-            t_g   = t_per_graph[g]
-            x_t_g = (1.0 - t_g) * x0_g + t_g * lig_x1_g
-
-            # Target velocity: v* = x_1 - x_0  (same formula, centered space)
-            target_list.append(lig_x1_g - x0_g)
-
-            lig_h_g  = unpacked["lig_h"][mask_lig]
-            poc_h_g  = unpacked["poc_h"][mask_poc]
-
-            # Remap edge indices to per-graph local space
-            lig_ei_g, lig_ea_g = _extract_subgraph_edges(
-                unpacked["lig_edge_index"], unpacked["lig_edge_attr"],
-                mask_lig, offset=mask_lig.nonzero(as_tuple=True)[0].min().item()
-            )
-            poc_ei_g, poc_ea_g = _extract_subgraph_edges(
-                unpacked["poc_edge_index"], unpacked["poc_edge_attr"],
-                mask_poc, offset=mask_poc.nonzero(as_tuple=True)[0].min().item()
-            )
-            cross_ei_g, cross_ea_g = _extract_cross_edges(
-                unpacked["cross_edge_index"], unpacked["cross_edge_attr"],
-                mask_lig, mask_poc,
-                lig_offset=mask_lig.nonzero(as_tuple=True)[0].min().item(),
-                poc_offset=mask_poc.nonzero(as_tuple=True)[0].min().item(),
-            )
-
-            v_g = self.model(
-                lig_x=x_t_g, lig_h=lig_h_g,
-                poc_x=poc_x_g, poc_h=poc_h_g,
-                lig_edge_index=lig_ei_g, lig_edge_attr=lig_ea_g,
-                poc_edge_index=poc_ei_g, poc_edge_attr=poc_ea_g,
-                cross_edge_index=cross_ei_g, cross_edge_attr=cross_ea_g,
-                t=t_g,
-            )
-            v_pred_list.append(v_g)
-
-        v_pred = torch.cat(v_pred_list, dim=0)   # [N_total, 3]
-        target = torch.cat(target_list,  dim=0)   # [N_total, 3]
-        loss   = nn.functional.mse_loss(v_pred, target)
-        return loss
+        return nn.functional.mse_loss(v_pred, target)
 
     # ------------------------------------------------------------------
     # Inference
@@ -184,65 +159,52 @@ class FlowMatcher(nn.Module):
         Returns:
             List of [N_lig_i, 3] tensors, one per molecule in batch.
         """
-        n_steps = n_steps or self.n_steps
-        unpacked = self._unpack_batch(batch)
-        lig_x1   = unpacked["lig_x"]
+        n_steps   = n_steps or self.n_steps
+        unpacked  = self._unpack_batch(batch)
+        lig_x1    = unpacked["lig_x"]
         lig_batch = unpacked["lig_batch"]
-        device   = lig_x1.device
+        poc_batch = unpacked["poc_batch"]
+        poc_x     = unpacked["poc_x"]
+        device    = lig_x1.device
 
-        n_graphs = lig_batch.max().item() + 1
+        n_graphs = int(lig_batch.max().item()) + 1
         dt = 1.0 / n_steps
 
-        # We generate per-graph to handle different time steps cleanly
-        results = []
-        for g in range(n_graphs):
-            mask_lig = lig_batch == g
-            mask_poc = unpacked["poc_batch"] == g
+        # Vectorized pocket centering (same as training)
+        poc_center = torch.zeros(n_graphs, 3, device=device)
+        poc_center.scatter_add_(
+            0, poc_batch.unsqueeze(1).expand_as(poc_x), poc_x
+        )
+        poc_count = poc_batch.bincount(minlength=n_graphs).float().unsqueeze(1)
+        poc_center = poc_center / poc_count   # [n_graphs, 3]
+        poc_x_c = poc_x - poc_center[poc_batch]   # [M_total, 3]
 
-            lig_h_g  = unpacked["lig_h"][mask_lig]
-            poc_x_g  = unpacked["poc_x"][mask_poc]
-            poc_h_g  = unpacked["poc_h"][mask_poc]
+        # Initialize noise for all molecules at once
+        x = torch.randn(lig_x1.size(0), 3, device=device)
 
-            # Center on pocket centroid (matches the centering done during training)
-            poc_center = poc_x_g.mean(0, keepdim=True)   # [1, 3]
-            poc_x_g    = poc_x_g - poc_center
+        # Pre-create time steps — same schedule for every molecule
+        times = torch.linspace(0.0, 1.0 - dt, n_steps, device=device)
 
-            lig_ei_g, lig_ea_g = _extract_subgraph_edges(
-                unpacked["lig_edge_index"], unpacked["lig_edge_attr"],
-                mask_lig, offset=mask_lig.nonzero(as_tuple=True)[0].min().item()
+        for step in range(n_steps):
+            t      = times[step]   # scalar, same t for all molecules
+            x_prev = x
+
+            v = self.model(
+                lig_x=x,                            lig_h=unpacked["lig_h"],
+                poc_x=poc_x_c,                      poc_h=unpacked["poc_h"],
+                lig_edge_index=unpacked["lig_edge_index"],
+                lig_edge_attr=unpacked["lig_edge_attr"],
+                poc_edge_index=unpacked["poc_edge_index"],
+                poc_edge_attr=unpacked["poc_edge_attr"],
+                cross_edge_index=unpacked["cross_edge_index"],
+                cross_edge_attr=unpacked["cross_edge_attr"],
+                t=t,
             )
-            poc_ei_g, poc_ea_g = _extract_subgraph_edges(
-                unpacked["poc_edge_index"], unpacked["poc_edge_attr"],
-                mask_poc, offset=mask_poc.nonzero(as_tuple=True)[0].min().item()
-            )
-            cross_ei_g, cross_ea_g = _extract_cross_edges(
-                unpacked["cross_edge_index"], unpacked["cross_edge_attr"],
-                mask_lig, mask_poc,
-                lig_offset=mask_lig.nonzero(as_tuple=True)[0].min().item(),
-                poc_offset=mask_poc.nonzero(as_tuple=True)[0].min().item(),
-            )
+            x = x + dt * v
+            x = _clamp_update(x, x_prev, max_delta=5.0)
 
-            # Start from Gaussian noise in centered pocket space
-            x = torch.randn(mask_lig.sum().item(), 3, device=device)
-
-            for step in range(n_steps):
-                t = torch.tensor(step * dt, device=device)
-                x_prev = x.clone()
-
-                v = self.model(
-                    lig_x=x, lig_h=lig_h_g,
-                    poc_x=poc_x_g, poc_h=poc_h_g,
-                    lig_edge_index=lig_ei_g, lig_edge_attr=lig_ea_g,
-                    poc_edge_index=poc_ei_g, poc_edge_attr=poc_ea_g,
-                    cross_edge_index=cross_ei_g, cross_edge_attr=cross_ea_g,
-                    t=t,
-                )
-                x = x + dt * v
-                x = _clamp_update(x, x_prev, max_delta=5.0)
-
-            results.append(x)
-
-        return results
+        # Split back into per-molecule tensors
+        return [x[lig_batch == g] for g in range(n_graphs)]
 
     # ------------------------------------------------------------------
     # Single-molecule generate (convenience)

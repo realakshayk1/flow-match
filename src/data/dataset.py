@@ -85,17 +85,21 @@ def make_dataloader(
     batch_size: int = 8,
     shuffle: bool = True,
     num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> DataLoader:
     """
     Returns a PyG DataLoader for HeteroData batches.
 
-    num_workers=0 on Windows (no fork support).
+    num_workers=0 on Windows (no fork support); set to 4+ on Linux/Mac.
+    pin_memory=True gives faster CPU→GPU transfers when training on CUDA.
     """
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
     )
 
 
