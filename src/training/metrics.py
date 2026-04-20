@@ -218,22 +218,30 @@ def compute_test_metrics(
         crystal_pos = batch["ligand"].pos
         n_graphs = int(lig_batch.max().item()) + 1
 
-        # Generate conformations
+        # Generated conformations
         generated = flow_matcher.generate(batch, n_steps=flow_matcher.n_steps)
 
-        # We need the RDKit mol to compute strain energy — stored as complex_id
-        # The mol must be fetched from the raw dataset (not available here).
-        # For RMSD we only need coordinates.
+        # SMILES stored per-graph in HeteroData (added by preprocess.py).
+        # PyG collates string attributes into a list when batching.
+        smiles_list = batch.smiles if hasattr(batch, "smiles") else None
+        if isinstance(smiles_list, str):
+            smiles_list = [smiles_list]
+
         for g in range(n_graphs):
-            mask = lig_batch == g
+            mask  = lig_batch == g
             crystal_g = crystal_pos[mask].cpu()
             gen_g     = generated[g].cpu()
 
             rmsd = kabsch_rmsd(gen_g, crystal_g)
             rmsd_all.append(rmsd)
 
-            # Strain energy requires mol — skip here, compute separately
-            strain_all.append(None)
+            # Compute strain if SMILES is available
+            strain = None
+            if smiles_list is not None and g < len(smiles_list):
+                mol = Chem.MolFromSmiles(smiles_list[g])
+                if mol is not None:
+                    strain = strain_energy_ratio(mol, gen_g.numpy())
+            strain_all.append(strain)
 
     rmsd_arr = np.array(rmsd_all)
     valid_strains = [s for s in strain_all if s is not None]
