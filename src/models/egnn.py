@@ -97,7 +97,7 @@ class EGNNLayer(nn.Module):
             coord_agg = coord_agg * update_mask
 
         # Node feature update via aggregated messages (with residual)
-        msg_agg = torch.zeros(h.size(0), m_ij.size(-1), device=h.device)
+        msg_agg = torch.zeros(h.size(0), m_ij.size(-1), device=h.device, dtype=h.dtype)
         msg_agg.scatter_add_(
             0,
             dst.unsqueeze(-1).expand_as(m_ij),
@@ -223,7 +223,7 @@ class EGNNFlowModel(nn.Module):
         # Combine into a single node tensor [N_lig + M_poc, D]
         h = torch.cat([h_lig, h_poc], dim=0)
         x = torch.cat([lig_x, poc_x], dim=0)
-        x_input = x.clone()  # save input coords — velocity = x_updated - x_input
+        x_lig_input = lig_x.clone()  # save only ligand input coords — velocity = x_updated - x_input
 
         # Build combined edge index — shift pocket indices to combined space
         # Ligand edges: indices already in [0, N_lig)
@@ -259,7 +259,7 @@ class EGNNFlowModel(nn.Module):
         #   coord_displacement = x_updated - x_input  → equivariant (rotates with input)
         #   scale              = out_scale(h)          → invariant scalar
         #   v                  = scale * displacement  → equivariant
-        coord_displacement = x[:N_lig] - x_input[:N_lig]   # [N_lig, 3]
+        coord_displacement = x[:N_lig] - x_lig_input        # [N_lig, 3]
         scale = self.out_scale(h[:N_lig])                   # [N_lig, 1]
         v = scale * coord_displacement                       # [N_lig, 3]
         return v

@@ -31,9 +31,12 @@ class PDBBindDataset(Dataset):
     Args:
         processed_dir: directory containing <complex_id>.pt files
         complex_ids:   list of complex IDs to include
+        cache:         if True, load all .pt files into RAM on construction.
+                       Eliminates repeated disk I/O across epochs. Recommended
+                       when the dataset fits in memory (PDBBind ~2-4 GB).
     """
 
-    def __init__(self, processed_dir: str, complex_ids: List[str]):
+    def __init__(self, processed_dir: str, complex_ids: List[str], cache: bool = True):
         super().__init__()
         self._data_dir = processed_dir  # avoid collision with PyG's processed_dir property
         self.complex_ids = [
@@ -41,10 +44,25 @@ class PDBBindDataset(Dataset):
             if os.path.exists(os.path.join(processed_dir, f"{cid}.pt"))
         ]
 
+        # Pre-load everything into RAM so epochs don't hit disk repeatedly.
+        self._cache: Optional[List] = None
+        if cache:
+            self._cache = [
+                _move_edges_to_edge_stores(
+                    torch.load(
+                        os.path.join(processed_dir, f"{cid}.pt"),
+                        weights_only=False,
+                    )
+                )
+                for cid in self.complex_ids
+            ]
+
     def len(self) -> int:
         return len(self.complex_ids)
 
     def get(self, idx: int) -> HeteroData:
+        if self._cache is not None:
+            return self._cache[idx]
         cid = self.complex_ids[idx]
         path = os.path.join(self._data_dir, f"{cid}.pt")
         data = torch.load(path, weights_only=False)

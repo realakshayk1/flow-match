@@ -214,10 +214,9 @@ def compute_test_metrics(
 
     for batch in test_loader:
         batch = batch.to(device)
-        unpacked = flow_matcher._unpack_batch(batch)
-        lig_batch = unpacked["lig_batch"]
-        crystal_pos = unpacked["lig_x"]
-        n_graphs = lig_batch.max().item() + 1
+        lig_batch = batch["ligand"].batch
+        crystal_pos = batch["ligand"].pos
+        n_graphs = int(lig_batch.max().item()) + 1
 
         # Generate conformations
         generated = flow_matcher.generate(batch, n_steps=flow_matcher.n_steps)

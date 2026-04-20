@@ -230,9 +230,12 @@ class FlowMatcher(nn.Module):
 
         x = torch.randn(lig_h.size(0), 3, device=device)
 
+        # Pre-create time steps (avoids allocating a new tensor per Euler step)
+        times = torch.linspace(0.0, 1.0 - dt, n_steps, device=device)
+
         for step in range(n_steps):
-            t = torch.tensor(step * dt, device=device)
-            x_prev = x.clone()
+            t      = times[step]  # scalar tensor
+            x_prev = x            # no clone needed — x + dt*v creates a new tensor
             v = self.model(
                 lig_x=x, lig_h=lig_h,
                 poc_x=poc_x, poc_h=poc_h,
