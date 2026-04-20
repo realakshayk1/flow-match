@@ -42,11 +42,13 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+from rdkit import Chem as _Chem
+
 from src.config.profiles import PROFILES, HardwareProfile
 from src.data.dataset import PDBBindDataset, load_splits, make_dataloader
 from src.models.egnn import EGNNFlowModel, count_parameters, build_default_model
 from src.models.flow_model import FlowMatcher
-from src.training.metrics import compute_test_metrics, kabsch_rmsd
+from src.training.metrics import compute_test_metrics, compute_etkdg_baseline, kabsch_rmsd
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +73,23 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     val_rmsd: float,
+    config: Optional[argparse.Namespace] = None,
 ):
-    torch.save({
+    ckpt = {
         "epoch":           epoch,
         "val_rmsd":        val_rmsd,
         "model_state":     model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-    }, path)
+    }
+    if config is not None:
+        ckpt["run_config"] = {
+            "profile":    config.profile,
+            "hidden_dim": config.hidden_dim,
+            "n_layers":   config.n_layers,
+            "batch_size": config.batch_size,
+            "lr":         config.lr,
+        }
+    torch.save(ckpt, path)
 
 
 def load_checkpoint(
@@ -339,7 +351,7 @@ def train(config: argparse.Namespace):
             if val_rmsd < best_val_rmsd:
                 best_val_rmsd = val_rmsd
                 patience_count = 0
-                save_checkpoint(best_ckpt_path, model, optimizer, epoch, val_rmsd)
+                save_checkpoint(best_ckpt_path, model, optimizer, epoch, val_rmsd, config)
                 print(f"  ✓ New best val RMSD: {val_rmsd:.3f} Å (saved checkpoint)")
             else:
                 patience_count += 1
@@ -367,6 +379,36 @@ def train(config: argparse.Namespace):
     if WANDB_AVAILABLE and config.wandb_project:
         wandb.log({f"test/{k}": v for k, v in test_metrics.items()
                    if isinstance(v, (int, float))})
+
+    # --- ETKDG baseline (requires SMILES stored in .pt files by preprocess.py) ---
+    mol_lookup = {}
+    for data in test_ds:
+        if hasattr(data, "smiles") and data.smiles:
+            mol = _Chem.MolFromSmiles(data.smiles)
+            if mol is not None:
+                mol_lookup[data.complex_id] = mol
+
+    if mol_lookup:
+        print(f"\nComputing ETKDG baseline on {len(mol_lookup)} molecules ...")
+        etkdg_metrics = compute_etkdg_baseline(test_loader, mol_lookup)
+        improvement = etkdg_metrics["rmsd_median"] - test_metrics["rmsd_median"]
+        print("\n=== ETKDG Baseline (no pocket knowledge) ===")
+        print(f"RMSD median:   {etkdg_metrics['rmsd_median']:.3f} Å")
+        print(f"RMSD mean:     {etkdg_metrics['rmsd_mean']:.3f} Å")
+        print(f"RMSD < 1 Å:    {etkdg_metrics['rmsd_pct_under_1A']:.1f}%")
+        print(f"RMSD < 2 Å:    {etkdg_metrics['rmsd_pct_under_2A']:.1f}%")
+        print(f"RMSD < 5 Å:    {etkdg_metrics['rmsd_pct_under_5A']:.1f}%")
+        print(f"\nModel is {improvement:.3f} Å better median RMSD than ETKDG baseline")
+
+        if WANDB_AVAILABLE and config.wandb_project:
+            wandb.log({f"etkdg/{k}": v for k, v in etkdg_metrics.items()
+                       if isinstance(v, (int, float))})
+            wandb.log({"etkdg/improvement_vs_model": improvement})
+    else:
+        print("\nSkipping ETKDG baseline — no SMILES found in test set.")
+        print("Re-run preprocess.py to add SMILES to .pt files.")
+
+    if WANDB_AVAILABLE and config.wandb_project:
         wandb.finish()
 
 
@@ -386,6 +428,7 @@ def parse_args():
     p.add_argument("--n_layers",            type=int,   default=None)
     p.add_argument("--batch_size",          type=int,   default=None)
     p.add_argument("--lr",                  type=float, default=None)
+    p.add_argument("--patience",            type=int,   default=None)
     p.add_argument("--n_inference_steps",   type=int,   default=None)
     p.add_argument("--val_inference_steps", type=int,   default=None)
     p.add_argument("--device",              type=str,   default=None,
@@ -395,7 +438,6 @@ def parse_args():
     p.add_argument("--processed_dir",   default="data/processed")
     p.add_argument("--splits",          default="data/splits.json")
     p.add_argument("--n_epochs",        type=int, default=100)
-    p.add_argument("--patience",        type=int, default=15)
     p.add_argument("--val_freq",        type=int, default=1)
     p.add_argument("--checkpoint_dir",  default="checkpoints")
     p.add_argument("--wandb_project",   default="")
@@ -404,13 +446,14 @@ def parse_args():
 
     # Fill None args from profile
     profile = PROFILES[args.profile]
-    if args.hidden_dim         is None: args.hidden_dim         = profile.hidden_dim
-    if args.n_layers           is None: args.n_layers           = profile.n_layers
-    if args.batch_size         is None: args.batch_size         = profile.batch_size
-    if args.lr                 is None: args.lr                 = profile.lr
-    if args.n_inference_steps  is None: args.n_inference_steps  = profile.n_inference_steps
+    if args.hidden_dim          is None: args.hidden_dim          = profile.hidden_dim
+    if args.n_layers            is None: args.n_layers            = profile.n_layers
+    if args.batch_size          is None: args.batch_size          = profile.batch_size
+    if args.lr                  is None: args.lr                  = profile.lr
+    if args.patience            is None: args.patience            = profile.patience
+    if args.n_inference_steps   is None: args.n_inference_steps   = profile.n_inference_steps
     if args.val_inference_steps is None: args.val_inference_steps = profile.val_inference_steps
-    if args.device             is None: args.device             = profile.default_device
+    if args.device              is None: args.device              = profile.default_device
 
     # num_workers: force 0 on Windows (no fork support)
     args.num_workers = profile.num_workers

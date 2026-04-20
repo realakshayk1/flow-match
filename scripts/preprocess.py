@@ -139,6 +139,7 @@ def process_one(args_tuple) -> dict:
         data["pocket", "to", "ligand"].edge_attr = cross_ea
 
         data.complex_id = pdb_id
+        data.smiles = Chem.MolToSmiles(mol)
 
         # Save
         out_path = os.path.join(out_dir, f"{pdb_id}.pt")
