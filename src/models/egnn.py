@@ -72,17 +72,25 @@ class EGNNLayer(nn.Module):
     ):
         src, dst = edge_index  # messages flow src → dst; aggregate at dst
 
-        diff = x[src] - x[dst]                          # [E, 3] — rotation equivariant
+        diff    = x[src] - x[dst]                          # [E, 3] — rotation equivariant
         dist_sq = (diff * diff).sum(dim=-1, keepdim=True)  # [E, 1] — rotation invariant
+
+        # Normalise distance so phi_e receives values in [0, ~1] regardless of
+        # absolute coordinate scale.  Dividing by (10 Å)² keeps typical protein-
+        # ligand distances (1-20 Å → dist_sq 1-400 Å²) in the range [0.01, 4].
+        # Without this, random weights × raw dist_sq (up to 400) blow up the
+        # messages and cause coordinate explosion → inf/NaN loss before step 1.
+        dist_sq_norm = dist_sq / 100.0                     # [E, 1]
 
         # Compute messages
         m_ij = self.phi_e(
-            torch.cat([h[src], h[dst], dist_sq, edge_attr], dim=-1)
+            torch.cat([h[src], h[dst], dist_sq_norm, edge_attr], dim=-1)
         )  # [E, hidden_dim]
 
-        # Equivariant coordinate update: weighted displacement, aggregated at dst
-        coord_weight = self.phi_x(m_ij)                # [E, 1]
-        coord_delta = diff * coord_weight               # [E, 3] — equivariant
+        # Equivariant coordinate update: tanh bounds each edge's contribution to
+        # [-1, 1] × ||diff||, preventing runaway coordinate growth across layers.
+        coord_weight = self.phi_x(m_ij).tanh()             # [E, 1]  ∈ (-1, 1)
+        coord_delta  = diff * coord_weight                  # [E, 3] — equivariant
 
         coord_agg = torch.zeros_like(x)                # [N, 3]
         coord_agg.scatter_add_(

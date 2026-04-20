@@ -131,6 +131,15 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         loss = flow_matcher.compute_loss(batch)
+
+        # Safety guard: skip this batch if loss is non-finite.  With random init
+        # and real-scale coordinates a single bad batch can produce inf/NaN loss;
+        # calling .backward() on inf gives NaN gradients which permanently corrupt
+        # all parameters.  Skipping the step lets the model recover on the next batch.
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         loss.backward()
 
         nn.utils.clip_grad_norm_(flow_matcher.parameters(), grad_clip)
