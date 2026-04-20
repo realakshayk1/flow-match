@@ -131,15 +131,24 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         loss = flow_matcher.compute_loss(batch)
+
+        # Safety guard: skip this batch if loss is non-finite.  With random init
+        # and real-scale coordinates a single bad batch can produce inf/NaN loss;
+        # calling .backward() on inf gives NaN gradients which permanently corrupt
+        # all parameters.  Skipping the step lets the model recover on the next batch.
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         loss.backward()
 
         nn.utils.clip_grad_norm_(flow_matcher.parameters(), grad_clip)
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += loss.detach()   # stay on device — avoid per-batch GPU sync
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+    return (total_loss / max(n_batches, 1)).item()  # one sync per epoch
 
 
 @torch.no_grad()
@@ -165,7 +174,7 @@ def val_epoch(
     for batch in loader:
         batch = batch.to(device)
         loss = flow_matcher.compute_loss(batch)
-        total_loss += loss.item()
+        total_loss += loss.detach()
         n_batches += 1
 
         # Generate one sample per molecule and compute RMSD
@@ -181,7 +190,7 @@ def val_epoch(
             rmsd_list.append(kabsch_rmsd(gen_g, crystal_g))
 
     import numpy as np
-    val_loss = total_loss / max(n_batches, 1)
+    val_loss = (total_loss / max(n_batches, 1)).item()  # one sync per epoch
     median_rmsd = float(np.median(rmsd_list)) if rmsd_list else float("inf")
     return val_loss, median_rmsd
 

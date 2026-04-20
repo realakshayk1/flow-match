@@ -72,17 +72,25 @@ class EGNNLayer(nn.Module):
     ):
         src, dst = edge_index  # messages flow src → dst; aggregate at dst
 
-        diff = x[src] - x[dst]                          # [E, 3] — rotation equivariant
+        diff    = x[src] - x[dst]                          # [E, 3] — rotation equivariant
         dist_sq = (diff * diff).sum(dim=-1, keepdim=True)  # [E, 1] — rotation invariant
+
+        # Normalise distance so phi_e receives values in [0, ~1] regardless of
+        # absolute coordinate scale.  Dividing by (10 Å)² keeps typical protein-
+        # ligand distances (1-20 Å → dist_sq 1-400 Å²) in the range [0.01, 4].
+        # Without this, random weights × raw dist_sq (up to 400) blow up the
+        # messages and cause coordinate explosion → inf/NaN loss before step 1.
+        dist_sq_norm = dist_sq / 100.0                     # [E, 1]
 
         # Compute messages
         m_ij = self.phi_e(
-            torch.cat([h[src], h[dst], dist_sq, edge_attr], dim=-1)
+            torch.cat([h[src], h[dst], dist_sq_norm, edge_attr], dim=-1)
         )  # [E, hidden_dim]
 
-        # Equivariant coordinate update: weighted displacement, aggregated at dst
-        coord_weight = self.phi_x(m_ij)                # [E, 1]
-        coord_delta = diff * coord_weight               # [E, 3] — equivariant
+        # Equivariant coordinate update: tanh bounds each edge's contribution to
+        # [-1, 1] × ||diff||, preventing runaway coordinate growth across layers.
+        coord_weight = self.phi_x(m_ij).tanh()             # [E, 1]  ∈ (-1, 1)
+        coord_delta  = diff * coord_weight                  # [E, 3] — equivariant
 
         coord_agg = torch.zeros_like(x)                # [N, 3]
         coord_agg.scatter_add_(
@@ -91,13 +99,19 @@ class EGNNLayer(nn.Module):
             coord_delta,
         )
 
+        # Normalise by in-degree so nodes with more neighbours don't accumulate
+        # proportionally larger updates (standard EGNN practice, Satorras et al.).
+        in_degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+        in_degree.scatter_add_(0, dst, torch.ones(dst.size(0), device=x.device, dtype=x.dtype))
+        coord_agg = coord_agg / in_degree.clamp(min=1.0).unsqueeze(-1)
+
         # Mask out pocket atom coordinate updates
         if fixed_mask is not None:
             update_mask = (~fixed_mask).float().unsqueeze(-1)  # [N, 1]
             coord_agg = coord_agg * update_mask
 
         # Node feature update via aggregated messages (with residual)
-        msg_agg = torch.zeros(h.size(0), m_ij.size(-1), device=h.device)
+        msg_agg = torch.zeros(h.size(0), m_ij.size(-1), device=h.device, dtype=h.dtype)
         msg_agg.scatter_add_(
             0,
             dst.unsqueeze(-1).expand_as(m_ij),
@@ -223,7 +237,7 @@ class EGNNFlowModel(nn.Module):
         # Combine into a single node tensor [N_lig + M_poc, D]
         h = torch.cat([h_lig, h_poc], dim=0)
         x = torch.cat([lig_x, poc_x], dim=0)
-        x_input = x.clone()  # save input coords — velocity = x_updated - x_input
+        x_lig_input = lig_x.clone()  # save only ligand input coords — velocity = x_updated - x_input
 
         # Build combined edge index — shift pocket indices to combined space
         # Ligand edges: indices already in [0, N_lig)
@@ -259,7 +273,7 @@ class EGNNFlowModel(nn.Module):
         #   coord_displacement = x_updated - x_input  → equivariant (rotates with input)
         #   scale              = out_scale(h)          → invariant scalar
         #   v                  = scale * displacement  → equivariant
-        coord_displacement = x[:N_lig] - x_input[:N_lig]   # [N_lig, 3]
+        coord_displacement = x[:N_lig] - x_lig_input        # [N_lig, 3]
         scale = self.out_scale(h[:N_lig])                   # [N_lig, 1]
         v = scale * coord_displacement                       # [N_lig, 3]
         return v
