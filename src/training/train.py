@@ -339,7 +339,16 @@ def val_epoch(
 # ---------------------------------------------------------------------------
 
 def train(config: argparse.Namespace):
+    from dataclasses import replace
     profile: HardwareProfile = PROFILES[config.profile]
+    
+    if hasattr(config, 'compile_model_override') and config.compile_model_override is not None:
+        profile = replace(profile, compile_model=(config.compile_model_override == "True"))
+        
+    if hasattr(config, 'amp_dtype_override') and config.amp_dtype_override is not None:
+        val = None if config.amp_dtype_override == "disabled" else config.amp_dtype_override
+        profile = replace(profile, amp_dtype=val)
+
 
     device = detect_device(config.device)
     print(f"Profile : {profile.name}")
@@ -521,6 +530,11 @@ def parse_args():
     p.add_argument("--max_test_examples", type=int, default=0, help="If > 0, restrict test set to this many examples for debugging.")
     p.add_argument("--debug_eval_examples", type=int, default=0, help="Number of examples to dump verbose tensor outputs for.")
     p.add_argument("--dump_eval_predictions", type=str, default="", help="Path to write per-example RMSD and chemistry failure summary JSONL to.")
+
+    p.add_argument("--compile_model_override", type=str, choices=["True", "False"], default=None,
+                   help="Override compile_model profile setting. Use 'True' or 'False'.")
+    p.add_argument("--amp_dtype_override", type=str, choices=["float16", "bfloat16", "disabled"], default=None,
+                   help="Override AMP dtype profile setting.")
 
     args = p.parse_args()
 
