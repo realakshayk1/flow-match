@@ -359,9 +359,6 @@ def passes_filters(mol: Chem.Mol) -> Tuple[bool, dict]:
     details["no_metal_ok"] = not has_metal
 
     passed = all([
-        details["mw_ok"],
-        details["rot_bonds_ok"],
-        details["heavy_atoms_ok"],
         details["no_metal_ok"],
     ])
 
