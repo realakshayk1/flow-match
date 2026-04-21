@@ -150,6 +150,104 @@ def _build_amp(profile: HardwareProfile, device: torch.device):
 
 
 # ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def run_full_test_evaluation(
+    flow_matcher,
+    model,
+    test_loader,
+    test_ds,
+    device,
+    config,
+    best_ckpt_path
+):
+    """
+    Unified end-of-training and eval-only testing execution block.
+    """
+    if os.path.exists(best_ckpt_path):
+        print(f"\n--- Checkpoint Load Verification ---")
+        print(f"Checkpoint path: {best_ckpt_path}")
+        print(f"Checkpoint exists: True")
+        ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
+        print(f"Checkpoint keys: {list(ckpt.keys())}")
+        if "epoch" in ckpt:
+            print(f"Epoch/Step: {ckpt['epoch']}")
+        
+        pre_sum = sum(p.abs().sum().item() for p in model.parameters())
+        missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+        post_sum = sum(p.abs().sum().item() for p in model.parameters())
+        
+        print(f"Missing keys: {len(missing)} ({missing[:3]}{'...' if len(missing)>3 else ''})")
+        print(f"Unexpected keys: {len(unexpected)} ({unexpected[:3]}{'...' if len(unexpected)>3 else ''})")
+        print(f"Total param checksum before: {pre_sum:.4f}")
+        print(f"Total param checksum after:  {post_sum:.4f}")
+        print(f"------------------------------------\n")
+    flow_matcher.eval()
+
+    test_metrics = compute_test_metrics(
+        flow_matcher, 
+        test_loader, 
+        device,
+        debug_eval_examples=getattr(config, 'debug_eval_examples', 0),
+        dump_eval_predictions=getattr(config, 'dump_eval_predictions', '')
+    )
+    print("\n=== Test Metrics (Resume-safe) ===")
+    print(f"RMSD median:   {test_metrics['rmsd_median']:.3f} Å")
+    print(f"RMSD mean:     {test_metrics['rmsd_mean']:.3f} Å")
+    print(f"RMSD < 1 Å:    {test_metrics['rmsd_pct_under_1A']:.1f}%")
+    print(f"RMSD < 2 Å:    {test_metrics['rmsd_pct_under_2A']:.1f}%")
+    print(f"RMSD < 5 Å:    {test_metrics['rmsd_pct_under_5A']:.1f}%")
+    print("\n=== Chemistry Metrics (Experimental) ===")
+    print(f"Strain median:         {test_metrics['strain_median']:.3f}")
+    failures = test_metrics.get('strain_failures', {})
+    print(f"Invalid geometry:      {failures.get('invalid_pose_geometry', 0)}")
+    print(f"RDKit/MMFF setup fail: {failures.get('rdkit_mmff_setup_failure', 0)}")
+    print(f"Absurd energy (>10k):  {failures.get('absurd_energy', 0)}")
+    print(f"Other failures:        {failures.get('other', 0)}")
+
+    if WANDB_AVAILABLE and config.wandb_project:
+        wandb.log({f"test/{k}": v for k, v in test_metrics.items()
+                   if isinstance(v, (int, float))})
+
+    # --- ETKDG baseline (requires SMILES stored in .pt files by preprocess.py) ---
+    mol_lookup = {}
+    for data in test_ds:
+        if hasattr(data, "smiles") and data.smiles:
+            mol = _Chem.MolFromSmiles(data.smiles)
+            if mol is not None:
+                mol_lookup[data.complex_id] = mol
+
+    if mol_lookup:
+        print(f"\nComputing ETKDG baseline on {len(mol_lookup)} molecules ...")
+        etkdg_metrics = compute_etkdg_baseline(test_loader, mol_lookup)
+        delta = test_metrics["rmsd_median"] - etkdg_metrics["rmsd_median"]
+        print("\n=== ETKDG Baseline (Experimental) ===")
+        print(f"RMSD median:   {etkdg_metrics['rmsd_median']:.3f} Å")
+        print(f"RMSD mean:     {etkdg_metrics['rmsd_mean']:.3f} Å")
+        print(f"RMSD < 1 Å:    {etkdg_metrics['rmsd_pct_under_1A']:.1f}%")
+        print(f"RMSD < 2 Å:    {etkdg_metrics['rmsd_pct_under_2A']:.1f}%")
+        print(f"RMSD < 5 Å:    {etkdg_metrics['rmsd_pct_under_5A']:.1f}%")
+        print(f"Failures breakdown: {etkdg_metrics.get('failures', {})}")
+        
+        if delta < 0:
+            print(f"Model is {abs(delta):.3f} Å better median RMSD than ETKDG baseline")
+        else:
+            print(f"Model is {delta:.3f} Å worse median RMSD than ETKDG baseline")
+
+        if WANDB_AVAILABLE and config.wandb_project:
+            wandb.log({f"etkdg/{k}": v for k, v in etkdg_metrics.items()
+                       if isinstance(v, (int, float))})
+            wandb.log({"etkdg/improvement_vs_model": -delta})
+    else:
+        print("\nSkipping ETKDG baseline — no SMILES found in test set.")
+        print("Re-run preprocess.py to add SMILES to .pt files.")
+
+    if WANDB_AVAILABLE and config.wandb_project:
+        wandb.finish()
+
+
+# ---------------------------------------------------------------------------
 # Epoch functions
 # ---------------------------------------------------------------------------
 
@@ -256,6 +354,11 @@ def train(config: argparse.Namespace):
     train_ds = PDBBindDataset(config.processed_dir, splits["train"])
     val_ds   = PDBBindDataset(config.processed_dir, splits["val"])
     test_ds  = PDBBindDataset(config.processed_dir, splits["test"])
+    if getattr(config, "max_test_examples", 0) > 0:
+        test_ds.complex_ids = test_ds.complex_ids[:config.max_test_examples]
+        if test_ds._cache is not None:
+            test_ds._cache = test_ds._cache[:config.max_test_examples]
+
 
     pin = device.type == "cuda"
     train_loader = make_dataloader(train_ds, batch_size=config.batch_size, shuffle=True,
@@ -373,60 +476,15 @@ def train(config: argparse.Namespace):
         print(f"\nBest val RMSD: {best_val_rmsd:.3f} Å")
 
     # --- Test evaluation ---
-    if os.path.exists(best_ckpt_path):
-        load_checkpoint(best_ckpt_path, model)
-    flow_matcher.eval()
-
-    test_metrics = compute_test_metrics(flow_matcher, test_loader, device)
-    print("\n=== Test Metrics (Resume-safe) ===")
-    print(f"RMSD median:   {test_metrics['rmsd_median']:.3f} Å")
-    print(f"RMSD mean:     {test_metrics['rmsd_mean']:.3f} Å")
-    print(f"RMSD < 1 Å:    {test_metrics['rmsd_pct_under_1A']:.1f}%")
-    print(f"RMSD < 2 Å:    {test_metrics['rmsd_pct_under_2A']:.1f}%")
-    print(f"RMSD < 5 Å:    {test_metrics['rmsd_pct_under_5A']:.1f}%")
-    print("\n=== Chemistry Metrics (Experimental) ===")
-    print(f"Strain median:         {test_metrics['strain_median']:.3f}")
-    failures = test_metrics.get('strain_failures', {})
-    print(f"Invalid geometry:      {failures.get('invalid_pose_geometry', 0)}")
-    print(f"RDKit/MMFF setup fail: {failures.get('rdkit_mmff_setup_failure', 0)}")
-    print(f"Absurd energy (>10k):  {failures.get('absurd_energy', 0)}")
-    print(f"Other failures:        {failures.get('other', 0)}")
-
-    if WANDB_AVAILABLE and config.wandb_project:
-        wandb.log({f"test/{k}": v for k, v in test_metrics.items()
-                   if isinstance(v, (int, float))})
-
-    # --- ETKDG baseline (requires SMILES stored in .pt files by preprocess.py) ---
-    mol_lookup = {}
-    for data in test_ds:
-        if hasattr(data, "smiles") and data.smiles:
-            mol = _Chem.MolFromSmiles(data.smiles)
-            if mol is not None:
-                mol_lookup[data.complex_id] = mol
-
-    if mol_lookup:
-        print(f"\nComputing ETKDG baseline on {len(mol_lookup)} molecules ...")
-        etkdg_metrics = compute_etkdg_baseline(test_loader, mol_lookup)
-        improvement = etkdg_metrics["rmsd_median"] - test_metrics["rmsd_median"]
-        print("\n=== ETKDG Baseline (Experimental) ===")
-        print(f"RMSD median:   {etkdg_metrics['rmsd_median']:.3f} Å")
-        print(f"RMSD mean:     {etkdg_metrics['rmsd_mean']:.3f} Å")
-        print(f"RMSD < 1 Å:    {etkdg_metrics['rmsd_pct_under_1A']:.1f}%")
-        print(f"RMSD < 2 Å:    {etkdg_metrics['rmsd_pct_under_2A']:.1f}%")
-        print(f"RMSD < 5 Å:    {etkdg_metrics['rmsd_pct_under_5A']:.1f}%")
-        print(f"\Failures breakdown: {etkdg_metrics.get('failures', {})}")
-        print(f"Model is {improvement:.3f} Å better median RMSD than ETKDG baseline")
-
-        if WANDB_AVAILABLE and config.wandb_project:
-            wandb.log({f"etkdg/{k}": v for k, v in etkdg_metrics.items()
-                       if isinstance(v, (int, float))})
-            wandb.log({"etkdg/improvement_vs_model": improvement})
-    else:
-        print("\nSkipping ETKDG baseline — no SMILES found in test set.")
-        print("Re-run preprocess.py to add SMILES to .pt files.")
-
-    if WANDB_AVAILABLE and config.wandb_project:
-        wandb.finish()
+    run_full_test_evaluation(
+        flow_matcher=flow_matcher,
+        model=model,
+        test_loader=test_loader,
+        test_ds=test_ds,
+        device=device,
+        config=config,
+        best_ckpt_path=best_ckpt_path
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +518,9 @@ def parse_args():
     p.add_argument("--wandb_project",   default="")
     p.add_argument("--eval_only",       action="store_true")
     p.add_argument("--resume_checkpoint", default=None, type=str)
+    p.add_argument("--max_test_examples", type=int, default=0, help="If > 0, restrict test set to this many examples for debugging.")
+    p.add_argument("--debug_eval_examples", type=int, default=0, help="Number of examples to dump verbose tensor outputs for.")
+    p.add_argument("--dump_eval_predictions", type=str, default="", help="Path to write per-example RMSD and chemistry failure summary JSONL to.")
 
     args = p.parse_args()
 

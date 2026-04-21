@@ -206,12 +206,17 @@ def compute_test_metrics(
     test_loader,
     device: torch.device,
     n_samples: int = 1,
+    debug_eval_examples: int = 0,
+    dump_eval_predictions: str = "",
 ) -> Dict:
     """
     Run full evaluation on a test DataLoader.
     """
     import sys
     sys.path.insert(0, ".")
+
+    import json
+    import os
 
     flow_matcher.eval()
     rmsd_all = []
@@ -222,6 +227,9 @@ def compute_test_metrics(
         "absurd_energy": 0,
         "other": 0
     }
+    
+    debug_count = 0
+    eval_dumps = []
 
     for batch in test_loader:
         batch = batch.to(device)
@@ -245,8 +253,19 @@ def compute_test_metrics(
             rmsd = kabsch_rmsd(gen_g, crystal_g)
             rmsd_all.append(rmsd)
 
+            complex_id = batch.complex_id[g] if hasattr(batch, "complex_id") and isinstance(batch.complex_id, list) else getattr(batch, "complex_id", f"batch_unk_{debug_count}")
+            
+            if debug_count < debug_eval_examples:
+                coords_nan = torch.isnan(gen_g).any().item() or torch.isinf(gen_g).any().item()
+                print(f"\n[DEBUG EVAL] Complex: {complex_id}")
+                print(f"  Target shape: {crystal_g.shape} | Pred shape: {gen_g.shape}")
+                print(f"  Pred domain: min={gen_g.min().item():.3f}, max={gen_g.max().item():.3f}, mean_norm={torch.norm(gen_g, dim=-1).mean().item():.3f}")
+                print(f"  Contains NaN/Inf: {coords_nan}")
+                print(f"  RMSD: {rmsd:.3f} Å")
+
             # Compute strain if SMILES is available
             strain = None
+            reason = None
             if smiles_list is not None and g < len(smiles_list):
                 mol = Chem.MolFromSmiles(smiles_list[g])
                 if mol is not None:
@@ -277,10 +296,30 @@ def compute_test_metrics(
                                 strain_failures["other"] += 1
             strain_all.append(strain)
 
+            if dump_eval_predictions:
+                eval_dumps.append({
+                    "complex_id": complex_id,
+                    "rmsd": float(rmsd) if not np.isnan(rmsd) else None,
+                    "strain": float(strain) if strain is not None else None,
+                    "chemistry_failure": reason if reason is not None else "success",
+                    "pred_coords_min": float(gen_g.min().item()),
+                    "pred_coords_max": float(gen_g.max().item()),
+                })
+            
+            debug_count += 1
+
     rmsd_arr = np.array(rmsd_all)
     valid_strains = [s for s in strain_all if s is not None]
 
     n_total_strain_attempted = sum(strain_failures.values()) + len(valid_strains)
+
+    if dump_eval_predictions and eval_dumps:
+        out_path = dump_eval_predictions
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        with open(out_path, "w") as f:
+            for item in eval_dumps:
+                f.write(json.dumps(item) + "\n")
+        print(f"\nDumped {len(eval_dumps)} predictions to {out_path}")
 
     return {
         "rmsd_all":          rmsd_all,
