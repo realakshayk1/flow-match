@@ -253,7 +253,14 @@ def compute_test_metrics(
                     # Sanity check against preprocessing metadata if available
                     metadata_match = True
                     if hasattr(batch, "ligand_meta_atom_count"):
-                        meta_count = batch.ligand_meta_atom_count[g] if isinstance(batch.ligand_meta_atom_count, list) else batch.ligand_meta_atom_count
+                        meta_data = batch.ligand_meta_atom_count
+                        if isinstance(meta_data, torch.Tensor):
+                            meta_count = meta_data[g].item()
+                        elif isinstance(meta_data, list):
+                            meta_count = meta_data[g]
+                        else:
+                            meta_count = meta_data
+
                         if mol.GetNumAtoms() != meta_count:
                             metadata_match = False
                     

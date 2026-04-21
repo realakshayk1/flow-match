@@ -268,6 +268,15 @@ def train(config: argparse.Namespace):
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
     # --- Model ---
+    if config.eval_only:
+        best_ckpt_path = config.resume_checkpoint if config.resume_checkpoint else os.path.join(config.checkpoint_dir, "best_model.pt")
+        if os.path.exists(best_ckpt_path):
+            ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
+            run_config = ckpt.get("run_config", {})
+            if run_config:
+                config.hidden_dim = run_config.get("hidden_dim", config.hidden_dim)
+                config.n_layers = run_config.get("n_layers", config.n_layers)
+
     model = build_default_model(
         hidden_dim=config.hidden_dim,
         n_layers=config.n_layers,
@@ -468,7 +477,7 @@ def parse_args():
     # num_workers: force 0 on Windows (no fork support)
     args.num_workers = profile.num_workers
     if platform.system() == "Windows" and args.num_workers > 0:
-        print(f"Windows detected: overriding num_workers {args.num_workers} → 0")
+        print(f"Windows detected: overriding num_workers {args.num_workers} -> 0")
         args.num_workers = 0
 
     return args
