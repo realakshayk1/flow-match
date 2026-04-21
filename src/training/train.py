@@ -362,7 +362,6 @@ def train(config: argparse.Namespace):
             print(f"  hidden_dim      : {hd}")
             print(f"  n_layers        : {nl}")
             if isinstance(hd, int) and isinstance(nl, int):
-                from src.models.egnn import build_default_model, count_parameters
                 m = build_default_model(hidden_dim=hd, n_layers=nl)
                 print(f"  Param count     : {count_parameters(m):,}")
         keys = list(ckpt["model_state"].keys())
