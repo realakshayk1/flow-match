@@ -341,10 +341,38 @@ def val_epoch(
 def train(config: argparse.Namespace):
     from dataclasses import replace
     profile: HardwareProfile = PROFILES[config.profile]
-    
+
+    # --inspect_checkpoint: dump checkpoint metadata and exit without running eval
+    if getattr(config, "inspect_checkpoint", False):
+        ckpt_path = config.resume_checkpoint if config.resume_checkpoint else os.path.join(config.checkpoint_dir, "best_model.pt")
+        if not os.path.exists(ckpt_path):
+            print(f"Checkpoint not found: {ckpt_path}")
+            return
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        rc = ckpt.get("run_config", {})
+        print(f"=== Checkpoint Inspection: {ckpt_path} ===")
+        print(f"  Checkpoint keys : {list(ckpt.keys())}")
+        print(f"  Epoch           : {ckpt.get('epoch', 'n/a')}")
+        print(f"  Val RMSD        : {ckpt.get('val_rmsd', 'n/a')}")
+        print(f"  run_config      : {rc if rc else '(not saved)'}")
+        if rc:
+            hd = rc.get("hidden_dim", "?")
+            nl = rc.get("n_layers", "?")
+            print(f"  Trained profile : {rc.get('profile', '?')}")
+            print(f"  hidden_dim      : {hd}")
+            print(f"  n_layers        : {nl}")
+            if isinstance(hd, int) and isinstance(nl, int):
+                from src.models.egnn import build_default_model, count_parameters
+                m = build_default_model(hidden_dim=hd, n_layers=nl)
+                print(f"  Param count     : {count_parameters(m):,}")
+        keys = list(ckpt["model_state"].keys())
+        print(f"  State dict keys : {len(keys)} ({keys[0]} ... {keys[-1]})")
+        print("==========================================")
+        return
+
     if hasattr(config, 'compile_model_override') and config.compile_model_override is not None:
         profile = replace(profile, compile_model=(config.compile_model_override == "True"))
-        
+
     if hasattr(config, 'amp_dtype_override') and config.amp_dtype_override is not None:
         val = None if config.amp_dtype_override == "disabled" else config.amp_dtype_override
         profile = replace(profile, amp_dtype=val)
@@ -385,9 +413,19 @@ def train(config: argparse.Namespace):
         if os.path.exists(best_ckpt_path):
             ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
             run_config = ckpt.get("run_config", {})
+            print(f"--- Checkpoint Architecture Probe ---")
+            print(f"  run_config in checkpoint: {bool(run_config)}")
             if run_config:
+                print(f"  checkpoint trained with profile : {run_config.get('profile', 'unknown')}")
+                print(f"  checkpoint hidden_dim           : {run_config.get('hidden_dim', 'not saved')}")
+                print(f"  checkpoint n_layers             : {run_config.get('n_layers', 'not saved')}")
                 config.hidden_dim = run_config.get("hidden_dim", config.hidden_dim)
                 config.n_layers = run_config.get("n_layers", config.n_layers)
+            else:
+                print(f"  No run_config — using profile defaults: hidden_dim={config.hidden_dim}, n_layers={config.n_layers}")
+            print(f"  Effective hidden_dim : {config.hidden_dim}")
+            print(f"  Effective n_layers   : {config.n_layers}")
+            print(f"-------------------------------------")
 
     model = build_default_model(
         hidden_dim=config.hidden_dim,
@@ -396,6 +434,7 @@ def train(config: argparse.Namespace):
 
     n_params = count_parameters(model)
     print(f"Parameters: {n_params:,} (limit: {profile.max_params:,})")
+    print(f"Architecture: hidden_dim={config.hidden_dim}, n_layers={config.n_layers}")
     if n_params > profile.max_params:
         raise ValueError(
             f"Model has {n_params:,} params — exceeds {profile.name} limit of "
@@ -527,6 +566,8 @@ def parse_args():
     p.add_argument("--wandb_project",   default="")
     p.add_argument("--eval_only",       action="store_true")
     p.add_argument("--resume_checkpoint", default=None, type=str)
+    p.add_argument("--inspect_checkpoint", action="store_true",
+                   help="Print checkpoint metadata (architecture, epoch, val_rmsd) and exit. No eval run.")
     p.add_argument("--max_test_examples", type=int, default=0, help="If > 0, restrict test set to this many examples for debugging.")
     p.add_argument("--debug_eval_examples", type=int, default=0, help="Number of examples to dump verbose tensor outputs for.")
     p.add_argument("--dump_eval_predictions", type=str, default="", help="Path to write per-example RMSD and chemistry failure summary JSONL to.")
