@@ -426,6 +426,16 @@ def train(config: argparse.Namespace):
             print(f"  Effective hidden_dim : {config.hidden_dim}")
             print(f"  Effective n_layers   : {config.n_layers}")
             print(f"-------------------------------------")
+        else:
+            print(f"")
+            print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print(f"  WARNING: --eval_only set but checkpoint NOT FOUND at:")
+            print(f"    {best_ckpt_path}")
+            print(f"  Model will run with RANDOM (untrained) weights.")
+            print(f"  All RMSD results will be meaningless.")
+            print(f"  Fix: mount Google Drive and pass --resume_checkpoint <path>")
+            print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print(f"")
 
     model = build_default_model(
         hidden_dim=config.hidden_dim,
