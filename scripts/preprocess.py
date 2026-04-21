@@ -173,28 +173,58 @@ def _find_file(directory: str, suffix: str) -> Optional[str]:
 # Deterministic split
 # ---------------------------------------------------------------------------
 
+def load_release_years(index_file: str) -> dict:
+    """Parse PDBBind index file (e.g. INDEX_refined_data.2020) → {pdb_id: year}."""
+    years = {}
+    with open(index_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                pdb_id = parts[0].lower()
+                try:
+                    years[pdb_id] = int(parts[2])
+                except ValueError:
+                    pass
+    return years
+
+
 def make_splits(
     ok_ids: list,
     val_frac: float = 0.1,
     test_frac: float = 0.1,
     seed: int = 42,
+    release_years: dict = None,
+    test_year: int = 2019,
 ) -> dict:
     """
-    Deterministic train/val/test split.
-    Uses PDBBind 2016 core IDs as test if available, else random split.
+    Time-split if release_years provided (matches DiffDock benchmark):
+      test  = complexes with release year >= test_year
+      val   = random 10% of remaining train
+      train = rest
+    Falls back to random split if release_years is None.
     """
+    if release_years is not None:
+        test_ids = [i for i in ok_ids if release_years.get(i, 0) >= test_year]
+        remaining = [i for i in ok_ids if i not in set(test_ids)]
+        rng = random.Random(seed)
+        rng.shuffle(remaining)
+        n_val = max(1, int(len(remaining) * val_frac))
+        val_ids = remaining[:n_val]
+        train_ids = remaining[n_val:]
+        return {"train": train_ids, "val": val_ids, "test": test_ids}
+
     rng = random.Random(seed)
     shuffled = list(ok_ids)
     rng.shuffle(shuffled)
-
     n_total = len(shuffled)
     n_test = max(1, int(n_total * test_frac))
     n_val = max(1, int(n_total * val_frac))
-
     test_ids = shuffled[:n_test]
     val_ids = shuffled[n_test:n_test + n_val]
     train_ids = shuffled[n_test + n_val:]
-
     return {"train": train_ids, "val": val_ids, "test": test_ids}
 
 
@@ -212,6 +242,10 @@ def main():
     parser.add_argument("--n_workers", type=int, default=max(1, cpu_count() - 1))
     parser.add_argument("--splits_out", default="data/splits.json")
     parser.add_argument("--log_out", default="data/filter_log.csv")
+    parser.add_argument("--index_file", default=None,
+                        help="PDBBind index file for time-split (e.g. INDEX_refined_data.2020)")
+    parser.add_argument("--test_year", type=int, default=2019,
+                        help="Complexes with release year >= this go to test (default: 2019)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -250,7 +284,11 @@ def main():
     print(df["status"].value_counts().to_string())
 
     if ok_ids:
-        splits = make_splits(ok_ids)
+        release_years = None
+        if args.index_file:
+            release_years = load_release_years(args.index_file)
+            print(f"Time-split: using release years from {args.index_file}, test_year >= {args.test_year}")
+        splits = make_splits(ok_ids, release_years=release_years, test_year=args.test_year)
         with open(args.splits_out, "w") as f:
             json.dump(splits, f, indent=2)
         print(f"\nSplit: {len(splits['train'])} train / {len(splits['val'])} val / {len(splits['test'])} test")
