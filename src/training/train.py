@@ -160,35 +160,24 @@ def run_full_test_evaluation(
     test_ds,
     device,
     config,
-    best_ckpt_path,
-    preloaded_ckpt=None,
+    best_ckpt_path
 ):
     """
     Unified end-of-training and eval-only testing execution block.
-
-    Pass preloaded_ckpt when weights have already been loaded (eval_only path)
-    to skip a redundant torch.load + load_state_dict.
     """
-    if preloaded_ckpt is not None:
-        ckpt = preloaded_ckpt
-        print(f"\n--- Checkpoint (pre-loaded) ---")
+    if os.path.exists(best_ckpt_path):
+        print(f"\n--- Checkpoint Load Verification ---")
         print(f"Checkpoint path: {best_ckpt_path}")
-        print(f"Checkpoint keys: {list(ckpt.keys())}")
-        if "epoch" in ckpt:
-            print(f"Epoch/Step: {ckpt['epoch']}")
-        print(f"------------------------------------\n")
-    elif os.path.exists(best_ckpt_path):
-        print(f"\n--- Checkpoint Load ---")
-        print(f"Checkpoint path: {best_ckpt_path}")
+        print(f"Checkpoint exists: True")
         ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
         print(f"Checkpoint keys: {list(ckpt.keys())}")
         if "epoch" in ckpt:
             print(f"Epoch/Step: {ckpt['epoch']}")
-
+        
         pre_sum = sum(p.abs().sum().item() for p in model.parameters())
         missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
         post_sum = sum(p.abs().sum().item() for p in model.parameters())
-
+        
         print(f"Missing keys: {len(missing)} ({missing[:3]}{'...' if len(missing)>3 else ''})")
         print(f"Unexpected keys: {len(unexpected)} ({unexpected[:3]}{'...' if len(unexpected)>3 else ''})")
         print(f"Total param checksum before: {pre_sum:.4f}")
@@ -373,6 +362,7 @@ def train(config: argparse.Namespace):
             print(f"  hidden_dim      : {hd}")
             print(f"  n_layers        : {nl}")
             if isinstance(hd, int) and isinstance(nl, int):
+                from src.models.egnn import build_default_model, count_parameters
                 m = build_default_model(hidden_dim=hd, n_layers=nl)
                 print(f"  Param count     : {count_parameters(m):,}")
         keys = list(ckpt["model_state"].keys())
@@ -397,58 +387,45 @@ def train(config: argparse.Namespace):
     print()
 
     # --- Data ---
-    # Skip train/val datasets entirely in eval_only mode — only test set is needed.
     splits = load_splits(config.splits)
-    test_ds = PDBBindDataset(config.processed_dir, splits["test"])
+    train_ds = PDBBindDataset(config.processed_dir, splits["train"])
+    val_ds   = PDBBindDataset(config.processed_dir, splits["val"])
+    test_ds  = PDBBindDataset(config.processed_dir, splits["test"])
     if getattr(config, "max_test_examples", 0) > 0:
         test_ds.complex_ids = test_ds.complex_ids[:config.max_test_examples]
         if test_ds._cache is not None:
             test_ds._cache = test_ds._cache[:config.max_test_examples]
 
-    pin = device.type == "cuda"
-    test_loader = make_dataloader(test_ds, batch_size=config.batch_size, shuffle=False,
-                                  num_workers=config.num_workers, pin_memory=pin)
 
-    if not config.eval_only:
-        train_ds = PDBBindDataset(config.processed_dir, splits["train"])
-        val_ds   = PDBBindDataset(config.processed_dir, splits["val"])
-        train_loader = make_dataloader(train_ds, batch_size=config.batch_size, shuffle=True,
-                                       num_workers=config.num_workers, pin_memory=pin)
-        val_loader   = make_dataloader(val_ds,   batch_size=config.batch_size, shuffle=False,
-                                       num_workers=config.num_workers, pin_memory=pin)
-        print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
-    else:
-        print(f"Test: {len(test_ds)}")
+    pin = device.type == "cuda"
+    train_loader = make_dataloader(train_ds, batch_size=config.batch_size, shuffle=True,
+                                   num_workers=config.num_workers, pin_memory=pin)
+    val_loader   = make_dataloader(val_ds,   batch_size=config.batch_size, shuffle=False,
+                                   num_workers=config.num_workers, pin_memory=pin)
+    test_loader  = make_dataloader(test_ds,  batch_size=config.batch_size, shuffle=False,
+                                   num_workers=config.num_workers, pin_memory=pin)
+
+    print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
     # --- Model ---
-    # In eval_only: load checkpoint once here to (a) read run_config for correct
-    # architecture, and (b) load weights before torch.compile so the compiled graph
-    # sees trained weights from the start.
-    best_ckpt_path = config.resume_checkpoint if config.resume_checkpoint else os.path.join(config.checkpoint_dir, "best_model.pt")
-    preloaded_ckpt = None
-
     if config.eval_only:
-        if not os.path.exists(best_ckpt_path):
-            raise FileNotFoundError(
-                f"--eval_only requires a checkpoint but none found at:\n"
-                f"  {best_ckpt_path}\n"
-                f"Mount Google Drive and pass --resume_checkpoint <path>"
-            )
-        preloaded_ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
-        run_config = preloaded_ckpt.get("run_config", {})
-        print(f"--- Checkpoint Architecture Probe ---")
-        print(f"  run_config in checkpoint: {bool(run_config)}")
-        if run_config:
-            print(f"  checkpoint trained with profile : {run_config.get('profile', 'unknown')}")
-            print(f"  checkpoint hidden_dim           : {run_config.get('hidden_dim', 'not saved')}")
-            print(f"  checkpoint n_layers             : {run_config.get('n_layers', 'not saved')}")
-            config.hidden_dim = run_config.get("hidden_dim", config.hidden_dim)
-            config.n_layers = run_config.get("n_layers", config.n_layers)
-        else:
-            print(f"  No run_config — using profile defaults: hidden_dim={config.hidden_dim}, n_layers={config.n_layers}")
-        print(f"  Effective hidden_dim : {config.hidden_dim}")
-        print(f"  Effective n_layers   : {config.n_layers}")
-        print(f"-------------------------------------")
+        best_ckpt_path = config.resume_checkpoint if config.resume_checkpoint else os.path.join(config.checkpoint_dir, "best_model.pt")
+        if os.path.exists(best_ckpt_path):
+            ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
+            run_config = ckpt.get("run_config", {})
+            print(f"--- Checkpoint Architecture Probe ---")
+            print(f"  run_config in checkpoint: {bool(run_config)}")
+            if run_config:
+                print(f"  checkpoint trained with profile : {run_config.get('profile', 'unknown')}")
+                print(f"  checkpoint hidden_dim           : {run_config.get('hidden_dim', 'not saved')}")
+                print(f"  checkpoint n_layers             : {run_config.get('n_layers', 'not saved')}")
+                config.hidden_dim = run_config.get("hidden_dim", config.hidden_dim)
+                config.n_layers = run_config.get("n_layers", config.n_layers)
+            else:
+                print(f"  No run_config — using profile defaults: hidden_dim={config.hidden_dim}, n_layers={config.n_layers}")
+            print(f"  Effective hidden_dim : {config.hidden_dim}")
+            print(f"  Effective n_layers   : {config.n_layers}")
+            print(f"-------------------------------------")
 
     model = build_default_model(
         hidden_dim=config.hidden_dim,
@@ -463,14 +440,6 @@ def train(config: argparse.Namespace):
             f"Model has {n_params:,} params — exceeds {profile.name} limit of "
             f"{profile.max_params:,}. Reduce --hidden_dim or --n_layers."
         )
-
-    # Load weights before torch.compile so the compiled graph traces trained weights.
-    if preloaded_ckpt is not None:
-        pre_sum = sum(p.abs().sum().item() for p in model.parameters())
-        missing, unexpected = model.load_state_dict(preloaded_ckpt["model_state"], strict=False)
-        post_sum = sum(p.abs().sum().item() for p in model.parameters())
-        print(f"Checkpoint weights loaded: {len(missing)} missing, {len(unexpected)} unexpected keys")
-        print(f"Param checksum  before: {pre_sum:.4f}  after: {post_sum:.4f}")
 
     # torch.compile: fuse kernels for repeated graph shapes (PyTorch 2.x)
     if profile.compile_model and device.type == "cuda":
@@ -494,6 +463,7 @@ def train(config: argparse.Namespace):
         wandb.init(project=config.wandb_project, config=vars(config))
 
     # --- Training loop ---
+    best_ckpt_path = config.resume_checkpoint if config.resume_checkpoint else os.path.join(config.checkpoint_dir, "best_model.pt")
 
     if not config.eval_only:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -561,8 +531,7 @@ def train(config: argparse.Namespace):
         test_ds=test_ds,
         device=device,
         config=config,
-        best_ckpt_path=best_ckpt_path,
-        preloaded_ckpt=preloaded_ckpt,
+        best_ckpt_path=best_ckpt_path
     )
 
 
