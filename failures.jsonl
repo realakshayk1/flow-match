@@ -1,0 +1,16 @@
+{"complex_id": "2iuz", "rmsd": 4.864884853363037, "strain": null, "chemistry_failure": "gen_invalid_pose_geometry: severe_clash", "pred_coords_min": -8.486953735351562, "pred_coords_max": 96.99231719970703}
+{"complex_id": "3b66", "rmsd": 2.289825439453125, "strain": 100564680.59069794, "chemistry_failure": "absurd_energy", "pred_coords_min": -1.08109712600708, "pred_coords_max": 31.634319305419922}
+{"complex_id": "6ny0", "rmsd": 1.56159245967865, "strain": null, "chemistry_failure": "gen_invalid_pose_geometry: severe_clash", "pred_coords_min": -1.4673759937286377, "pred_coords_max": 5.625893592834473}
+{"complex_id": "3suu", "rmsd": 3.350565195083618, "strain": 1438482035.2592943, "chemistry_failure": "absurd_energy", "pred_coords_min": -18.51262855529785, "pred_coords_max": 36.94419479370117}
+{"complex_id": "1uwu", "rmsd": 1.2424712181091309, "strain": 27844816412.38279, "chemistry_failure": "absurd_energy", "pred_coords_min": 18.59188461303711, "pred_coords_max": 92.06156158447266}
+{"complex_id": "5his", "rmsd": 0.7780619859695435, "strain": -128473548.35708947, "chemistry_failure": "absurd_energy", "pred_coords_min": -18.62112045288086, "pred_coords_max": 3.141104221343994}
+{"complex_id": "1wdn", "rmsd": 1.8969290256500244, "strain": -103106576.95834957, "chemistry_failure": "absurd_energy", "pred_coords_min": -2.006694793701172, "pred_coords_max": 21.99263572692871}
+{"complex_id": "2vmf", "rmsd": 2.2405271530151367, "strain": 1323348139.4645293, "chemistry_failure": "absurd_energy", "pred_coords_min": -4.657524108886719, "pred_coords_max": 50.51614761352539}
+{"complex_id": "5ti0", "rmsd": 1.6682674884796143, "strain": null, "chemistry_failure": "gen_invalid_pose_geometry: severe_clash", "pred_coords_min": -6.585472106933594, "pred_coords_max": 17.704816818237305}
+{"complex_id": "5umx", "rmsd": 3.7355825901031494, "strain": null, "chemistry_failure": "gen_invalid_pose_geometry: severe_clash", "pred_coords_min": -5.312134742736816, "pred_coords_max": 11.495253562927246}
+{"complex_id": "5oq8", "rmsd": 4.387363433837891, "strain": null, "chemistry_failure": "gen_invalid_pose_geometry: severe_clash", "pred_coords_min": -6.24491024017334, "pred_coords_max": 19.62145233154297}
+{"complex_id": "1upf", "rmsd": 1.8719288110733032, "strain": -5879323637.922551, "chemistry_failure": "absurd_energy", "pred_coords_min": 7.570278167724609, "pred_coords_max": 100.10752868652344}
+{"complex_id": "6eq8", "rmsd": 3.5277597904205322, "strain": null, "chemistry_failure": "gen_invalid_pose_geometry: severe_clash", "pred_coords_min": 3.927729368209839, "pred_coords_max": 139.94712829589844}
+{"complex_id": "4q9y", "rmsd": 1.361810326576233, "strain": 85993936.31156039, "chemistry_failure": "absurd_energy", "pred_coords_min": 0.5027236938476562, "pred_coords_max": 17.32404899597168}
+{"complex_id": "6nu5", "rmsd": 1.212995171546936, "strain": 1439546094.597483, "chemistry_failure": "absurd_energy", "pred_coords_min": -5.929468154907227, "pred_coords_max": 45.12995147705078}
+{"complex_id": "3l0v", "rmsd": 1.7778890132904053, "strain": -1442039056.3692794, "chemistry_failure": "absurd_energy", "pred_coords_min": 2.8367435932159424, "pred_coords_max": 31.307313919067383}
