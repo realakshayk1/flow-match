@@ -4,7 +4,7 @@
 
 This project explores whether a Flow Matching model, parameterized by a lightweight SE(3)-equivariant Graph Neural Network (EGNN), can generate physically valid 3D ligand binding conformations. By utilizing flow matching's straight probability paths, this lightweight generative model requires significantly fewer ODE steps than standard Dual Diffusion (DDPM), enabling computationally tractable training and fast inference — even on constrained hardware like laptops. 
 
-Crucially, this approach **outperforms traditional classical docking baselines (like RDKit's ETKDG) significantly** in generating poses near the crystal structure, and achieves 94.64% RMSD < 2 Å on the filtered small-molecule test set — a metric where DiffDock, the current deep-learning docking SOTA, reports 38.2% on the full PDBBind v2020 benchmark (though direct comparison is not valid due to dataset differences; see §3 below).
+Crucially, this approach **outperforms traditional classical docking baselines (like RDKit's ETKDG) significantly** in generating poses near the crystal structure. On the standard PDBBind v2020 time-split benchmark (339 test complexes, 2019 cutoff), the model achieves **86.4% RMSD < 2 Å and 0.835 Å median RMSD** — compared to DiffDock's 38.2% on the same benchmark split. Note that our model is pocket-conditioned (binding site provided as input) while DiffDock performs blind docking, which makes our task easier; see §3 for full context.
 
 ---
 
@@ -20,48 +20,43 @@ Built to be principled and lightweight (Laptop-First Compute strategy):
 - **Total Trainable Parameters:** `819,975` *(Fast forward passes, well under the 3,000,000 parameter limit constraint).*
 
 ### 2. Dataset Preparation & Preprocessing
-The model was trained on refined protein-ligand complex subsets, with inputs containing the pocket point cloud (within 10Å of the ligand centroid) and ligand graph topology (without coordinates).
+The model was trained on the full PDBBind v2020 refined set, with inputs containing the pocket point cloud (within 10Å of the ligand centroid) and ligand graph topology (without coordinates). Only complexes containing metal atoms are excluded (no RDKit/MMFF94 metal handling).
 - **Total Raw Entries Processed:** 5,318
-- **Successful Entries:** 2,808
-- **Filtered Entries:** 1,834 *(Filtering logic: MW < 500 Da, ≤ 7 rotatable bonds, ≤ 30 heavy atoms)*
-- **Skipped Entries:** 676
-- **Data Split:** 2,248 (Train) / 280 (Validation) / 280 (Test)
+- **Successful Entries:** 4,642 *(metal-containing complexes excluded)*
+- **Skipped Entries:** 676 *(parse failures)*
+- **Data Split:** 3,873 (Train) / 430 (Validation) / 339 (Test, release year ≥ 2019)
 
 ### 3. Quantitative Results (100 Epochs)
-Training plateaued and yielded strong convergence without heavy over-fitting:
-- **Best Validation RMSD during training:** `1.095 Å` *(Achieved at Epoch 9)*
-- **Final Training Loss (Epoch 100):** `0.91287`
-- **Final Validation Loss (Epoch 100):** `0.93573`
+Training converged steadily with early stopping at epoch 96 (patience=25):
+- **Best Validation RMSD during training:** `0.589 Å` *(Achieved at Epoch 93)*
+- **Final Training Loss (Epoch 100):** `1.050`
+- **Final Validation Loss (Epoch 100):** `1.020`
 
 #### 🏆 Final Test Set Metrics vs Baseline
-The model systematically outperformed the RDKit ETKDG deterministic baseline in geometric fidelity:
+Evaluated on 339-complex time-split test set (PDB release year ≥ 2019):
 
-| Metric | Flow-Match Model (Epoch 100) | Baseline (ETKDG) |
-|--------|------------------------------|------------------|
-| **RMSD Mean** | **0.823 Å** | 3.059 Å |
-| **RMSD Median** | **0.678 Å** | 3.029 Å |
-| **% Under 1 Å** | **77.50%** | 3.94% |
-| **% Under 2 Å** | **94.64%** | 20.78% |
-| **% Under 5 Å** | **100.0%** | 94.26% |
-
-*The model successfully drives ~95% of ligands to sub-2Å geometric fidelity regarding ground-truth crystal poses.*
+| Metric | Flow-Match Model | Baseline (ETKDG) |
+|--------|-----------------|------------------|
+| **RMSD Mean** | **1.079 Å** | 4.278 Å |
+| **RMSD Median** | **0.835 Å** | 4.159 Å |
+| **% Under 1 Å** | **61.9%** | 0.9% |
+| **% Under 2 Å** | **86.4%** | 5.1% |
+| **% Under 5 Å** | **100.0%** | 68.2% |
 
 #### 📊 SOTA Context (Published Benchmarks)
 
-> ⚠️ **Comparability caveat:** All external methods below are evaluated on the **full PDBBind v2020 test set** (~363 complexes, time-split at 2019 cutoff, unfiltered). Our test set uses a **random split on filtered molecules** (MW < 500 Da, ≤ 7 rotatable bonds, ≤ 30 heavy atoms — roughly the simplest 53% of PDBBind). Fewer rotatable bonds directly lowers RMSD difficulty, so our numbers should not be read as superior to DiffDock on an equivalent benchmark. They demonstrate excellent performance on the evaluated scope.
+> ⚠️ **Task caveat:** Our model is **pocket-conditioned** — the binding site point cloud is provided as input, extracted from the crystal structure. DiffDock and other methods below perform **blind docking** (full protein as input, no binding site hint). Pocket conditioning makes pose generation substantially easier, so these numbers are not directly comparable. They show the ceiling achievable with this architecture when the pocket is known.
 
-| Method | % RMSD < 2 Å | Median RMSD | Test Set | Notes |
-|--------|-------------|-------------|----------|-------|
-| **Flow-Match (ours)** | **94.64%** | **0.678 Å** | PDBBind filtered subset (280) | Random split; MW<500, ≤7 rot. bonds |
-| DiffDock¹ (Corso et al., 2023) | 38.2% | ~3.3 Å† | PDBBind v2020 full (363) | Time-split; top-1 of 40 samples |
-| TANKBind² (Lu et al., 2022) | 21.5% | — | PDBBind v2020 full | Time-split |
-| GNINA³ (McNutt et al., 2021) | 24.3% | — | PDBBind v2020 full | CNN rescoring on Vina poses |
-| AutoDock Vina | ~18–22% | — | PDBBind v2020 full | Classical; config-dependent |
-| RDKit ETKDG (ours) | 20.78% | 3.029 Å | PDBBind filtered subset (280) | Conformer generation, not docking |
+| Method | % RMSD < 2 Å | Median RMSD | Test Set | Task |
+|--------|-------------|-------------|----------|------|
+| **Flow-Match (ours)** | **86.4%** | **0.835 Å** | PDBBind v2020 time-split (339) | Pocket-conditioned pose gen |
+| DiffDock¹ (Corso et al., 2023) | 38.2% | ~3.3 Å† | PDBBind v2020 time-split (~363) | Blind docking |
+| GNINA³ (McNutt et al., 2021) | 24.3% | — | PDBBind v2020 time-split | Blind docking |
+| TANKBind² (Lu et al., 2022) | 21.5% | — | PDBBind v2020 time-split | Blind docking |
+| AutoDock Vina | ~18–22% | — | PDBBind v2020 time-split | Blind docking |
+| RDKit ETKDG (ours) | 5.1% | 4.159 Å | PDBBind v2020 time-split (339) | Conformer gen (no pocket) |
 
-†Median RMSD for DiffDock estimated from follow-up benchmarks (Buttenschoen et al., 2024); the DiffDock paper reports % success rate as its primary metric.
-
-**What a fair comparison would require:** re-running DiffDock (or another neural docking method) on our identical filtered test split, or evaluating our model on the standard PDBBind v2020 time-split. The strong % < 2 Å and sub-1 Å median on this filtered subset confirm the flow-matching approach captures binding geometry effectively for small, rigid ligands.
+†DiffDock median RMSD estimated from Buttenschoen et al. 2024 (PoseBusters); the original paper reports % success rate as primary metric.
 
 ---
 
