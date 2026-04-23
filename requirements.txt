@@ -23,3 +23,6 @@ notebook
 
 # Testing
 pytest==8.2.2
+
+# Evaluation
+posebusters>=0.2.7

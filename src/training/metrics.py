@@ -197,6 +197,40 @@ def mol_with_coords(mol: Chem.Mol, coords: np.ndarray) -> Chem.Mol:
     return mol_new.GetMol()
 
 
+def uff_minimize(mol: Chem.Mol, coords: np.ndarray, max_iters: int = 200) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    Run RDKit UFF minimization starting from generated coordinates.
+    Returns (minimized_heavy_atom_coords, failure_reason).
+    Failure_reason is None on success.
+    """
+    if not np.isfinite(coords).all():
+        return None, "non_finite_input_coords"
+    if coords.shape[0] != mol.GetNumAtoms():
+        return None, "atom_count_mismatch"
+
+    try:
+        mol_h = Chem.AddHs(mol)
+        # Embed to place H atoms, then overwrite heavy atom positions
+        ret = AllChem.EmbedMolecule(mol_h, randomSeed=42)
+        if ret != 0:
+            return None, "embed_failed"
+
+        conf = mol_h.GetConformer()
+        for i in range(mol.GetNumAtoms()):
+            conf.SetAtomPosition(i, coords[i].tolist())
+
+        result = AllChem.UFFOptimizeMolecule(mol_h, maxIters=max_iters)
+        # result: 0 = converged, 1 = more iters needed, -1 = failure
+        if result == -1:
+            return None, "uff_optimization_failed"
+
+        mol_noH = Chem.RemoveHs(mol_h)
+        opt_coords = mol_noH.GetConformer().GetPositions()
+        return opt_coords.astype(np.float32), None
+    except Exception as e:
+        return None, f"exception_{str(e)[:60]}"
+
+
 # ---------------------------------------------------------------------------
 # Full evaluation
 # ---------------------------------------------------------------------------

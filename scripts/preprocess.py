@@ -26,6 +26,7 @@ import traceback
 from multiprocessing import Pool, cpu_count
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import HeteroData
@@ -117,6 +118,29 @@ def process_one(args_tuple) -> dict:
             status["status"] = "skip"
             status["reason"] = "pocket_too_small"
             return status
+
+        # Canonicalize atom order so MolFromSmiles(MolToSmiles(mol)) round-trips stably.
+        # Strategy: generate canonical SMILES, parse it back, use GetSubstructMatch to
+        # find how original SDF atom indices map to canonical SMILES atom indices, then
+        # reorder the crystal coordinates accordingly.
+        mol_canon = Chem.MolFromSmiles(Chem.MolToSmiles(mol))
+        if mol_canon is None:
+            status["status"] = "error"
+            status["reason"] = "canon_smiles_parse_failed"
+            return status
+        match = mol.GetSubstructMatch(mol_canon)
+        if not match:
+            status["status"] = "error"
+            status["reason"] = "canon_substruct_match_failed"
+            return status
+        # match[i] = SDF atom index that corresponds to canonical position i
+        crystal_coords = mol.GetConformer().GetPositions()
+        canon_coords = crystal_coords[list(match)]
+        conf = Chem.Conformer(mol_canon.GetNumAtoms())
+        for i, (x, y, z) in enumerate(canon_coords.tolist()):
+            conf.SetAtomPosition(i, (x, y, z))
+        mol_canon.AddConformer(conf, assignId=True)
+        mol = mol_canon
 
         # Featurize
         lig_h, lig_ei, lig_ea, lig_pos = featurize_ligand(mol)

@@ -58,6 +58,18 @@ Evaluated on 339-complex time-split test set (PDB release year ≥ 2019):
 
 †DiffDock median RMSD estimated from Buttenschoen et al. 2024 (PoseBusters); the original paper reports % success rate as primary metric.
 
+## PoseBusters Evaluation (re-docking, test set, N=280)
+
+| Method | PB-valid % | RMSD median | RMSD < 2 Å |
+|--------|-----------|-------------|------------|
+| Flow-Match (raw) | 0.0% | 2.473 Å | 38.2% |
+| Flow-Match + UFF | 10.0% | 2.395 Å | 37.5% |
+| AutoDock Vina* | ~67% | ~1.8 Å | ~72% |
+| DiffDock (blind)** | ~42% | ~3.1 Å | ~38% |
+
+*Vina PB-valid from PoseBusters paper Table 2 (re-docking setting).
+**DiffDock PB-valid from PoseBusters paper Table 2.
+
 ---
 
 ## 🧬 Architecture Overview
