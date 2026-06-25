@@ -1,0 +1,17 @@
+compound_id,smiles,source
+toy_001,CN1C=NC2=C1N=CN=C2N,toy_seed
+toy_002,CC1=CC(=O)NC(=O)N1,toy_seed
+toy_003,CCOC1=CC=C(C=C1)NC(=O)N2CCN(CC2)C,toy_seed
+toy_004,CC1=NC(=O)N(C)C(=O)N1,toy_seed
+toy_005,CCN(CC)CCOC(=O)C1=CC=CC=C1Cl,toy_seed
+toy_006,CC(C)NCC(O)COC1=CC=CC=C1,toy_seed
+toy_007,CCOC(=O)N1CCC(CC1)N2C=NC3=NC=NC(=C32)N,toy_seed
+toy_008,CC1=CC(=O)N(C)C(=O)N1C,toy_seed
+toy_009,CC(C)C1=CC=C(C=C1)C(C)C(=O)O,toy_seed
+toy_010,CCN1C(=O)NC2=CC=CC=C21,toy_seed
+toy_011,CCOC(=O)C1=CC=CC=C1OC,toy_seed
+toy_012,C1CC,toy_seed
+toy_013,CCOC(=O)NCCN(CC)CC,toy_seed
+toy_014,CN(C)CCOC1=CC=CC=C1C(=O)O,toy_seed
+toy_015,CC1=NN(C(=O)N1)C2=CC=CC=C2,toy_seed
+toy_016,CCOC1=NC=NC(=N1)NCC2=CC=CC=C2,toy_seed

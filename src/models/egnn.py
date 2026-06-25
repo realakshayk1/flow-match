@@ -177,6 +177,7 @@ class EGNNFlowModel(nn.Module):
         cross_edge_dim: int = 16,
         hidden_dim: int = 64,
         n_layers: int = 4,
+        with_confidence: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -207,7 +208,18 @@ class EGNNFlowModel(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(
+        # Optional confidence head: maps invariant per-ligand-atom features to a per-atom
+        # logit. Pooled per graph it estimates P(dock RMSD < 2 A) for a generated pose.
+        # Operates on invariant h, so it does not affect the velocity field's equivariance.
+        self.confidence_head = None
+        if with_confidence:
+            self.confidence_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+    def _encode(
         self,
         lig_x: Tensor,
         lig_h: Tensor,
@@ -220,7 +232,8 @@ class EGNNFlowModel(nn.Module):
         cross_edge_index: Tensor,
         cross_edge_attr: Tensor,
         t: Tensor,
-    ) -> Tensor:
+    ):
+        """Run input embeddings + EGNN layers. Returns (h, x, N_lig, x_lig_input)."""
         N_lig = lig_h.size(0)
         M_poc = poc_h.size(0)
 
@@ -240,17 +253,11 @@ class EGNNFlowModel(nn.Module):
         x_lig_input = lig_x.clone()  # save only ligand input coords — velocity = x_updated - x_input
 
         # Build combined edge index — shift pocket indices to combined space
-        # Ligand edges: indices already in [0, N_lig)
-        # Pocket edges: shift by N_lig to [N_lig, N_lig + M_poc)
         poc_ei_shifted = poc_edge_index + N_lig
-
-        # Cross edges: pocket source shifted, ligand target stays as-is
         cross_ei_shifted = torch.stack([
             cross_edge_index[0] + N_lig,  # pocket source → combined space
             cross_edge_index[1],           # ligand target → combined space (already correct)
         ], dim=0)
-
-        # Concatenate all edges
         combined_ei = torch.cat([lig_edge_index, poc_ei_shifted, cross_ei_shifted], dim=1)
 
         # Embed and concatenate all edge attributes
@@ -265,9 +272,44 @@ class EGNNFlowModel(nn.Module):
         fixed_mask = torch.zeros(N_lig + M_poc, dtype=torch.bool, device=h.device)
         fixed_mask[N_lig:] = True
 
-        # Run EGNN layers
         for layer in self.layers:
             h, x = layer(h, x, combined_ei, combined_attr, fixed_mask)
+
+        return h, x, N_lig, x_lig_input
+
+    def confidence_atom_logits(self, *args, **kwargs) -> Tensor:
+        """
+        Per-ligand-atom confidence logits [N_lig, 1] for a (generated) pose. Pool these per
+        graph (scatter-mean over the ligand batch vector) and apply sigmoid to obtain
+        P(dock RMSD < 2 A). Same call signature as ``forward``.
+
+        Uses invariant features only, so the confidence score is SE(3)-invariant.
+        """
+        if self.confidence_head is None:
+            raise RuntimeError("Model was built without a confidence head (with_confidence=False).")
+        h, _, N_lig, _ = self._encode(*args, **kwargs)
+        return self.confidence_head(h[:N_lig])  # [N_lig, 1]
+
+    def forward(
+        self,
+        lig_x: Tensor,
+        lig_h: Tensor,
+        poc_x: Tensor,
+        poc_h: Tensor,
+        lig_edge_index: Tensor,
+        lig_edge_attr: Tensor,
+        poc_edge_index: Tensor,
+        poc_edge_attr: Tensor,
+        cross_edge_index: Tensor,
+        cross_edge_attr: Tensor,
+        t: Tensor,
+    ) -> Tensor:
+        h, x, N_lig, x_lig_input = self._encode(
+            lig_x, lig_h, poc_x, poc_h,
+            lig_edge_index, lig_edge_attr,
+            poc_edge_index, poc_edge_attr,
+            cross_edge_index, cross_edge_attr, t,
+        )
 
         # Equivariant velocity output:
         #   coord_displacement = x_updated - x_input  → equivariant (rotates with input)
