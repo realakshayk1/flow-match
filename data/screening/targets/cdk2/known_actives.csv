@@ -1,0 +1,5 @@
+target,compound_id,std_smiles,is_active,source_note
+cdk2,toy_001,CN1C=NC2=C1N=CN=C2N,1,toy_reference
+cdk2,toy_007,CCOC(=O)N1CCC(CC1)N2C=NC3=NC=NC(=C32)N,1,toy_reference
+cdk2,toy_016,CCOC1=NC=NC(=N1)NCC2=CC=CC=C2,1,toy_reference
+egfr,egfr_ref_001,CN(C)CCOC1=CC2=C(C=C1)N=CN=C2N,1,placeholder

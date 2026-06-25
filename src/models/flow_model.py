@@ -40,10 +40,15 @@ class FlowMatcher(nn.Module):
         n_steps: int — Euler integration steps at inference (default 20)
     """
 
-    def __init__(self, model: EGNNFlowModel, n_steps: int = 20):
+    def __init__(self, model: EGNNFlowModel, n_steps: int = 20,
+                 geom_loss_weight: float = 0.0):
         super().__init__()
         self.model = model
         self.n_steps = n_steps
+        # Weight on the bonded-geometry auxiliary loss (0 disables it). Penalizes the model's
+        # implied clean endpoint for having ligand bond lengths that deviate from the crystal,
+        # which directly attacks the bad-geometry / low PB-valid failure mode.
+        self.geom_loss_weight = geom_loss_weight
 
     # ------------------------------------------------------------------
     # Batch unpacking
@@ -134,7 +139,25 @@ class FlowMatcher(nn.Module):
             t=t_atom,  # [N_total] per-atom time
         )
 
-        return nn.functional.mse_loss(v_pred, target)
+        fm_loss = nn.functional.mse_loss(v_pred, target)
+
+        if self.geom_loss_weight <= 0.0:
+            return fm_loss
+
+        # Bonded-geometry auxiliary loss on the model's implied clean endpoint.
+        #   x_t = x0 + t * v  =>  x1_hat = x_t + (1 - t) * v_pred
+        x1_hat = x_t + (1.0 - t_col) * v_pred                  # [N_total, 3]
+
+        lig_ei = unpacked["lig_edge_index"]                    # [2, E] global ligand indices
+        if lig_ei.numel() == 0:
+            return fm_loss
+
+        src, dst = lig_ei
+        pred_len = (x1_hat[src] - x1_hat[dst]).norm(dim=-1)     # [E]
+        true_len = (lig_x1_c[src] - lig_x1_c[dst]).norm(dim=-1)  # [E] crystal bond lengths
+        geom_loss = nn.functional.mse_loss(pred_len, true_len)
+
+        return fm_loss + self.geom_loss_weight * geom_loss
 
     # ------------------------------------------------------------------
     # Inference
@@ -209,6 +232,96 @@ class FlowMatcher(nn.Module):
         # either way, but downstream use (e.g. saving to PDB) requires the
         # original frame.
         return [x[lig_batch == g] + poc_center[g] for g in range(n_graphs)]
+
+    # ------------------------------------------------------------------
+    # Multi-pose generation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def generate_multi(
+        self,
+        batch: HeteroData,
+        n_poses: int = 10,
+        n_steps: Optional[int] = None,
+    ) -> List[List[Tensor]]:
+        """
+        Generate ``n_poses`` independent conformations per molecule by reseeding the initial
+        noise x_0 each time. Each pose is a full Euler trajectory (same machinery as
+        ``generate``), so poses differ only in their starting noise.
+
+        Returns:
+            poses[p][g] -> [N_lig_g, 3] tensor: the p-th pose of graph g, in the PDB frame.
+            Outer length == n_poses, inner length == number of graphs in the batch.
+
+        This is the sampling half of the multi-pose + confidence-ranking lever: downstream a
+        confidence head scores each pose and the argmax is reported as top-1.
+        """
+        return [self.generate(batch, n_steps=n_steps) for _ in range(n_poses)]
+
+    # ------------------------------------------------------------------
+    # Confidence scoring / training
+    # ------------------------------------------------------------------
+
+    def _pose_atom_logits(self, batch: HeteroData, pose: List[Tensor], t_value: float = 1.0) -> Tensor:
+        """
+        Run the confidence head on a batch of poses. ``pose`` is a list of per-graph [N_g, 3]
+        coordinate tensors in the PDB frame (as returned by ``generate``). Coordinates are
+        pocket-centered to match training, then encoded at time ``t_value``.
+
+        Returns per-ligand-atom logits [N_total, 1].
+        """
+        unpacked = self._unpack_batch(batch)
+        lig_batch = unpacked["lig_batch"]
+        poc_batch = unpacked["poc_batch"]
+        poc_x = unpacked["poc_x"]
+        device = poc_x.device
+        n_graphs = int(lig_batch.max().item()) + 1
+
+        # Reassemble [N_total, 3] in ligand order and pocket-center per graph.
+        x = torch.cat([pose[g].to(device) for g in range(n_graphs)], dim=0)
+
+        poc_center = torch.zeros(n_graphs, 3, device=device)
+        poc_center.scatter_add_(0, poc_batch.unsqueeze(1).expand_as(poc_x), poc_x)
+        poc_count = poc_batch.bincount(minlength=n_graphs).float().unsqueeze(1)
+        poc_center = poc_center / poc_count
+        x_c = x - poc_center[lig_batch]
+        poc_x_c = poc_x - poc_center[poc_batch]
+
+        t = torch.full((lig_batch.size(0),), float(t_value), device=device)
+        return self.model.confidence_atom_logits(
+            x_c, unpacked["lig_h"], poc_x_c, unpacked["poc_h"],
+            unpacked["lig_edge_index"], unpacked["lig_edge_attr"],
+            unpacked["poc_edge_index"], unpacked["poc_edge_attr"],
+            unpacked["cross_edge_index"], unpacked["cross_edge_attr"], t,
+        )
+
+    @torch.no_grad()
+    def confidence_scores(self, batch: HeteroData, pose: List[Tensor], t_value: float = 1.0) -> Tensor:
+        """Per-graph confidence in [0, 1] = sigmoid(mean atom logit). Shape [n_graphs]."""
+        logits = self._pose_atom_logits(batch, pose, t_value).squeeze(-1)  # [N_total]
+        lig_batch = batch["ligand"].batch
+        n_graphs = int(lig_batch.max().item()) + 1
+        pooled = torch.zeros(n_graphs, device=logits.device)
+        pooled.scatter_add_(0, lig_batch, logits)
+        counts = lig_batch.bincount(minlength=n_graphs).float().clamp(min=1.0)
+        return torch.sigmoid(pooled / counts)
+
+    def confidence_loss(self, batch: HeteroData, pose: List[Tensor], labels: Tensor,
+                        t_value: float = 1.0) -> Tensor:
+        """
+        BCE loss for the confidence head. ``labels`` is [n_graphs] in {0,1} = (dock RMSD < 2 A).
+        Pools per-graph mean atom logit and compares to the label.
+        """
+        logits = self._pose_atom_logits(batch, pose, t_value).squeeze(-1)  # [N_total]
+        lig_batch = batch["ligand"].batch
+        n_graphs = int(lig_batch.max().item()) + 1
+        pooled = torch.zeros(n_graphs, device=logits.device)
+        pooled.scatter_add_(0, lig_batch, logits)
+        counts = lig_batch.bincount(minlength=n_graphs).float().clamp(min=1.0)
+        graph_logits = pooled / counts
+        return nn.functional.binary_cross_entropy_with_logits(
+            graph_logits, labels.to(graph_logits.device).float()
+        )
 
     # ------------------------------------------------------------------
     # Single-molecule generate (convenience)

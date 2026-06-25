@@ -42,12 +42,18 @@ def main():
     print("\nComputing test metrics ...")
     test_metrics = compute_test_metrics(flow_matcher, test_loader, device)
 
-    print("\n=== Model RMSD ===")
-    print(f"RMSD median:   {test_metrics['rmsd_median']:.3f} Å")
-    print(f"RMSD mean:     {test_metrics['rmsd_mean']:.3f} Å")
-    print(f"RMSD < 1 Å:    {test_metrics['rmsd_pct_under_1A']:.1f}%")
-    print(f"RMSD < 2 Å:    {test_metrics['rmsd_pct_under_2A']:.1f}%")
-    print(f"RMSD < 5 Å:    {test_metrics['rmsd_pct_under_5A']:.1f}%")
+    print("\n=== Dock RMSD (in-frame, symmetry-corrected) — the comparable metric ===")
+    print(f"Dock RMSD median:   {test_metrics['dock_rmsd_median']:.3f} Å  (n={test_metrics['n_dock_rmsd_valid']})")
+    print(f"Dock RMSD mean:     {test_metrics['dock_rmsd_mean']:.3f} Å")
+    print(f"Dock RMSD < 2 Å:    {test_metrics['dock_rmsd_pct_under_2A']:.1f}%")
+    print(f"Dock RMSD < 5 Å:    {test_metrics['dock_rmsd_pct_under_5A']:.1f}%")
+
+    print("\n=== Shape RMSD (Kabsch-aligned) — conformer fidelity, NOT docking ===")
+    print(f"Shape RMSD median:  {test_metrics['rmsd_median']:.3f} Å")
+    print(f"Shape RMSD mean:    {test_metrics['rmsd_mean']:.3f} Å")
+    print(f"Shape RMSD < 1 Å:   {test_metrics['rmsd_pct_under_1A']:.1f}%")
+    print(f"Shape RMSD < 2 Å:   {test_metrics['rmsd_pct_under_2A']:.1f}%")
+    print(f"Shape RMSD < 5 Å:   {test_metrics['rmsd_pct_under_5A']:.1f}%")
 
 if __name__ == "__main__":
     main()

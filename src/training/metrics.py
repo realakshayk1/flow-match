@@ -73,6 +73,71 @@ def kabsch_rmsd(P: Tensor, Q: Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Symmetry-corrected, in-frame (docking) RMSD
+# ---------------------------------------------------------------------------
+
+def symmetry_rmsd(
+    mol: Chem.Mol,
+    pred_coords: np.ndarray,
+    crystal_coords: np.ndarray,
+    max_matches: int = 1000,
+) -> float:
+    """
+    In-frame, symmetry-corrected RMSD — the docking metric used by PoseBusters/DiffDock.
+
+    Unlike ``kabsch_rmsd`` this performs **no superposition**: both poses are assumed to be
+    in the same coordinate frame (the crystal/PDB frame), so the result reflects whether the
+    ligand is *placed* correctly in the pocket, not merely whether its shape matches.
+
+    Molecular symmetry is handled by enumerating the automorphism group of ``mol`` via
+    self-substructure matching and returning the minimum RMSD over all atom relabelings.
+    ``pred_coords`` and ``crystal_coords`` must both be ordered to match ``mol``'s atoms
+    (guaranteed by the canonicalization in ``scripts/preprocess.py``).
+
+    Args:
+        mol:            RDKit mol giving the bond graph (used only for symmetry enumeration)
+        pred_coords:    [N, 3] predicted heavy-atom coordinates, mol atom order
+        crystal_coords: [N, 3] reference heavy-atom coordinates, mol atom order
+        max_matches:    cap on automorphisms enumerated (highly symmetric ligands)
+
+    Returns:
+        RMSD in Angstroms (float), or NaN on atom-count mismatch / non-finite input.
+    """
+    P = np.asarray(pred_coords, dtype=np.float64)
+    Q = np.asarray(crystal_coords, dtype=np.float64)
+
+    if P.shape != Q.shape or P.shape[0] != mol.GetNumAtoms():
+        return float("nan")
+    if not (np.isfinite(P).all() and np.isfinite(Q).all()):
+        return float("nan")
+
+    # Enumerate automorphisms: each match maps query atom i -> mol atom match[i].
+    try:
+        matches = mol.GetSubstructMatches(
+            mol, uniquify=False, useChirality=False, maxMatches=max_matches
+        )
+    except Exception:
+        matches = ()
+
+    # Fall back to the identity mapping if symmetry enumeration found nothing.
+    if not matches:
+        matches = (tuple(range(mol.GetNumAtoms())),)
+
+    best = float("inf")
+    for match in matches:
+        idx = np.asarray(match, dtype=np.int64)
+        if idx.shape[0] != P.shape[0]:
+            continue
+        # Compare pred atom i against crystal atom match[i] — no alignment.
+        diff = P - Q[idx]
+        rmsd = float(np.sqrt((diff * diff).sum(axis=-1).mean()))
+        if rmsd < best:
+            best = rmsd
+
+    return best if best != float("inf") else float("nan")
+
+
+# ---------------------------------------------------------------------------
 # MMFF94 energy
 # ---------------------------------------------------------------------------
 
@@ -231,6 +296,78 @@ def uff_minimize(mol: Chem.Mol, coords: np.ndarray, max_iters: int = 200) -> Tup
         return None, f"exception_{str(e)[:60]}"
 
 
+def pocket_aware_relax(
+    mol: Chem.Mol,
+    pred_coords: np.ndarray,
+    pocket_coords: Optional[np.ndarray] = None,
+    restraint_k: float = 100.0,
+    max_displ: float = 1.0,
+    max_iters: int = 400,
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    Polish a predicted pose so it becomes physically valid (PoseBusters `mol` checks: bond
+    lengths/angles, clashes, planarity) **without discarding the learned placement**.
+
+    Method (the FlowDock "+EM" recipe): run an MMFF94 minimization of the ligand starting from
+    the predicted heavy-atom coordinates, with a per-atom **harmonic positional restraint**
+    toward the prediction (force constant ``restraint_k``, slack ``max_displ`` Å). Local geometry
+    relaxes to valid values while the global pose stays within ~``max_displ`` Å of the model
+    output, so the in-frame dock RMSD does not blow up.
+
+    PoseBusters `mol` mode validates ligand-internal geometry only, so a ligand-restrained
+    minimization is sufficient for PB-valid. ``pocket_coords`` is accepted for future
+    protein-context relaxation (rigid steric shell) but is not required for `mol`-mode validity;
+    when provided it is currently ignored to keep the routine robust and deterministic.
+
+    Args:
+        mol:           RDKit mol (heavy atoms, matching ``pred_coords`` order)
+        pred_coords:   [N_heavy, 3] predicted coordinates
+        pocket_coords: optional [M, 3] pocket heavy-atom coordinates (reserved; see note)
+        restraint_k:   harmonic force constant (kcal/mol/A^2) toward the predicted position
+        max_displ:     allowed displacement (A) before the restraint engages
+        max_iters:     MMFF minimization iterations
+
+    Returns:
+        (relaxed_heavy_coords float32 [N_heavy, 3], failure_reason). reason is None on success.
+        Falls back to plain UFF minimization if MMFF parameterization is unavailable.
+    """
+    if not np.isfinite(pred_coords).all():
+        return None, "non_finite_input_coords"
+    if pred_coords.shape[0] != mol.GetNumAtoms():
+        return None, "atom_count_mismatch"
+
+    try:
+        mol_h = Chem.AddHs(mol)
+        if AllChem.EmbedMolecule(mol_h, randomSeed=42) != 0:
+            return None, "embed_failed"
+
+        conf = mol_h.GetConformer()
+        for i in range(mol.GetNumAtoms()):
+            conf.SetAtomPosition(i, pred_coords[i].tolist())
+
+        props = AllChem.MMFFGetMoleculeProperties(mol_h)
+        if props is None:
+            # Molecule unsupported by MMFF — fall back to (unrestrained) UFF.
+            return uff_minimize(mol, pred_coords, max_iters=max_iters)
+
+        ff = AllChem.MMFFGetMoleculeForceField(mol_h, props)
+        if ff is None:
+            return uff_minimize(mol, pred_coords, max_iters=max_iters)
+
+        # Harmonic restraint of every heavy atom toward its (current = predicted) position.
+        for i in range(mol.GetNumAtoms()):
+            ff.MMFFAddPositionConstraint(i, max_displ, restraint_k)
+
+        ff.Initialize()
+        ff.Minimize(maxIts=max_iters)
+
+        mol_noH = Chem.RemoveHs(mol_h)
+        relaxed = mol_noH.GetConformer().GetPositions()
+        return relaxed.astype(np.float32), None
+    except Exception as e:
+        return None, f"exception_{str(e)[:60]}"
+
+
 # ---------------------------------------------------------------------------
 # Full evaluation
 # ---------------------------------------------------------------------------
@@ -253,7 +390,8 @@ def compute_test_metrics(
     import os
 
     flow_matcher.eval()
-    rmsd_all = []
+    rmsd_all = []        # shape RMSD (Kabsch-aligned) — conformer fidelity, not placement
+    dock_rmsd_all = []   # in-frame symmetry-corrected RMSD — the docking metric
     strain_all = []
     strain_failures = {
         "invalid_pose_geometry": 0,
@@ -284,11 +422,22 @@ def compute_test_metrics(
             crystal_g = crystal_pos[mask].cpu()
             gen_g     = generated[g].cpu()
 
-            rmsd = kabsch_rmsd(gen_g, crystal_g)
+            rmsd = kabsch_rmsd(gen_g, crystal_g)   # shape RMSD (Kabsch-aligned)
             rmsd_all.append(rmsd)
 
             complex_id = batch.complex_id[g] if hasattr(batch, "complex_id") and isinstance(batch.complex_id, list) else getattr(batch, "complex_id", f"batch_unk_{debug_count}")
-            
+
+            # Build the RDKit mol once (used for both dock RMSD and strain).
+            mol = None
+            if smiles_list is not None and g < len(smiles_list):
+                mol = Chem.MolFromSmiles(smiles_list[g])
+
+            # In-frame, symmetry-corrected docking RMSD (no superposition).
+            dock_rmsd = float("nan")
+            if mol is not None and mol.GetNumAtoms() == gen_g.shape[0]:
+                dock_rmsd = symmetry_rmsd(mol, gen_g.numpy(), crystal_g.numpy())
+            dock_rmsd_all.append(dock_rmsd)
+
             if debug_count < debug_eval_examples:
                 coords_nan = torch.isnan(gen_g).any().item() or torch.isinf(gen_g).any().item()
                 print(f"\n[DEBUG EVAL] Complex: {complex_id}")
@@ -297,43 +446,43 @@ def compute_test_metrics(
                 print(f"  Contains NaN/Inf: {coords_nan}")
                 print(f"  RMSD: {rmsd:.3f} Å")
 
-            # Compute strain if SMILES is available
+            # Compute strain if a valid mol is available
             strain = None
             reason = None
-            if smiles_list is not None and g < len(smiles_list):
-                mol = Chem.MolFromSmiles(smiles_list[g])
-                if mol is not None:
-                    # Sanity check against preprocessing metadata if available
-                    metadata_match = True
-                    if hasattr(batch, "ligand_meta_atom_count"):
-                        meta_data = batch.ligand_meta_atom_count
-                        if isinstance(meta_data, torch.Tensor):
-                            meta_count = meta_data[g].item()
-                        elif isinstance(meta_data, list):
-                            meta_count = meta_data[g]
-                        else:
-                            meta_count = meta_data
+            if mol is not None:
+                # Sanity check against preprocessing metadata if available
+                metadata_match = True
+                if hasattr(batch, "ligand_meta_atom_count"):
+                    meta_data = batch.ligand_meta_atom_count
+                    if isinstance(meta_data, torch.Tensor):
+                        meta_count = meta_data[g].item()
+                    elif isinstance(meta_data, list):
+                        meta_count = meta_data[g]
+                    else:
+                        meta_count = meta_data
 
-                        if mol.GetNumAtoms() != meta_count:
-                            metadata_match = False
-                    
-                    if metadata_match:
-                        strain, reason = strain_energy_ratio(mol, gen_g.numpy())
-                        if reason is not None:
-                            if "invalid_pose_geometry" in reason:
-                                strain_failures["invalid_pose_geometry"] += 1
-                            elif "rdkit_mmff_setup_failure" in reason:
-                                strain_failures["rdkit_mmff_setup_failure"] += 1
-                            elif "absurd_energy" in reason:
-                                strain_failures["absurd_energy"] += 1
-                            else:
-                                strain_failures["other"] += 1
+                    if mol.GetNumAtoms() != meta_count:
+                        metadata_match = False
+
+                if metadata_match:
+                    strain, reason = strain_energy_ratio(mol, gen_g.numpy())
+                    if reason is not None:
+                        if "invalid_pose_geometry" in reason:
+                            strain_failures["invalid_pose_geometry"] += 1
+                        elif "rdkit_mmff_setup_failure" in reason:
+                            strain_failures["rdkit_mmff_setup_failure"] += 1
+                        elif "absurd_energy" in reason:
+                            strain_failures["absurd_energy"] += 1
+                        else:
+                            strain_failures["other"] += 1
             strain_all.append(strain)
 
             if dump_eval_predictions:
                 eval_dumps.append({
                     "complex_id": complex_id,
                     "rmsd": float(rmsd) if not np.isnan(rmsd) else None,
+                    "shape_rmsd": float(rmsd) if not np.isnan(rmsd) else None,
+                    "dock_rmsd": float(dock_rmsd) if not np.isnan(dock_rmsd) else None,
                     "strain": float(strain) if strain is not None else None,
                     "chemistry_failure": reason if reason is not None else "success",
                     "pred_coords_min": float(gen_g.min().item()),
@@ -343,6 +492,7 @@ def compute_test_metrics(
             debug_count += 1
 
     rmsd_arr = np.array(rmsd_all)
+    dock_arr = np.array([r for r in dock_rmsd_all if not np.isnan(r)])
     valid_strains = [s for s in strain_all if s is not None]
 
     n_total_strain_attempted = sum(strain_failures.values()) + len(valid_strains)
@@ -356,12 +506,23 @@ def compute_test_metrics(
         print(f"\nDumped {len(eval_dumps)} predictions to {out_path}")
 
     return {
+        # Shape RMSD (Kabsch-aligned). Kept under the legacy "rmsd_*" keys for back-compat;
+        # also exposed under explicit "shape_rmsd_*" names.
         "rmsd_all":          rmsd_all,
         "rmsd_median":       float(np.median(rmsd_arr)) if len(rmsd_arr) else float("nan"),
         "rmsd_mean":         float(np.mean(rmsd_arr)) if len(rmsd_arr) else float("nan"),
         "rmsd_pct_under_1A": float((rmsd_arr < 1.0).mean() * 100) if len(rmsd_arr) else 0.0,
         "rmsd_pct_under_2A": float((rmsd_arr < 2.0).mean() * 100) if len(rmsd_arr) else 0.0,
         "rmsd_pct_under_5A": float((rmsd_arr < 5.0).mean() * 100) if len(rmsd_arr) else 0.0,
+        "shape_rmsd_median": float(np.median(rmsd_arr)) if len(rmsd_arr) else float("nan"),
+        "shape_rmsd_pct_under_2A": float((rmsd_arr < 2.0).mean() * 100) if len(rmsd_arr) else 0.0,
+        # In-frame, symmetry-corrected docking RMSD — the comparable metric.
+        "dock_rmsd_all":     dock_rmsd_all,
+        "dock_rmsd_median":  float(np.median(dock_arr)) if len(dock_arr) else float("nan"),
+        "dock_rmsd_mean":    float(np.mean(dock_arr)) if len(dock_arr) else float("nan"),
+        "dock_rmsd_pct_under_2A": float((dock_arr < 2.0).mean() * 100) if len(dock_arr) else 0.0,
+        "dock_rmsd_pct_under_5A": float((dock_arr < 5.0).mean() * 100) if len(dock_arr) else 0.0,
+        "n_dock_rmsd_valid": int(len(dock_arr)),
         "strain_all":        strain_all,
         "strain_median":     float(np.median(valid_strains)) if valid_strains else float("nan"),
         "strain_mean":       float(np.mean(valid_strains)) if valid_strains else float("nan"),
@@ -448,12 +609,18 @@ def compute_etkdg_baseline(test_loader, mol_lookup: Dict) -> Dict:
     valid_strains = [s for s in strain_all if s is not None]
 
     return {
+        # ETKDG is a free-space conformer generator: it produces no pocket placement, so only
+        # shape RMSD (Kabsch-aligned) is meaningful. In-frame "dock_rmsd" is intentionally not
+        # reported here — it is reserved for actual placement methods (model, Vina, DiffDock).
         "rmsd_all":          rmsd_all,
         "rmsd_median":       float(np.median(rmsd_arr)) if len(rmsd_arr) else float("nan"),
         "rmsd_mean":         float(np.mean(rmsd_arr)) if len(rmsd_arr) else float("nan"),
         "rmsd_pct_under_1A": float((rmsd_arr < 1.0).mean() * 100) if len(rmsd_arr) else 0.0,
         "rmsd_pct_under_2A": float((rmsd_arr < 2.0).mean() * 100) if len(rmsd_arr) else 0.0,
         "rmsd_pct_under_5A": float((rmsd_arr < 5.0).mean() * 100) if len(rmsd_arr) else 0.0,
+        "shape_rmsd_median": float(np.median(rmsd_arr)) if len(rmsd_arr) else float("nan"),
+        "shape_rmsd_pct_under_2A": float((rmsd_arr < 2.0).mean() * 100) if len(rmsd_arr) else 0.0,
+        "dock_rmsd_applicable": False,
         "strain_all":        strain_all,
         "strain_median":     float(np.median(valid_strains)) if valid_strains else float("nan"),
         "strain_mean":       float(np.mean(valid_strains)) if valid_strains else float("nan"),

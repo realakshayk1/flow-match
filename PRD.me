@@ -1,10 +1,10 @@
 # PRD: 3D Ligand Conformation Generation via SE(3)-Equivariant Flow Matching
 
 **Project Type:** ML Research Project  
-**Timeline:** 6–8 weeks  
-**Compute:** Laptop only (CPU + Apple MPS or CUDA if available; no cluster)  
-**Priority:** Generative model (EGNN + flow matching) > evaluation pipeline  
-**Status:** Not started
+**Timeline:** 8–12 weeks (improvement cycle, no full retrain required for Phases 1–4)  
+**Compute:** Google Colab (GPU) for training, laptop for inference/development  
+**Priority:** Evaluation credibility and deployment readiness > model architecture changes  
+**Status:** Improvement plan active (Phase 1 in progress)
 
 ---
 
@@ -12,58 +12,57 @@
 
 Classical docking pipelines (AutoDock, Glide) generate ligand binding conformations by exhaustive search over rotatable bonds, scoring against a force field. They are computationally expensive, non-differentiable, and cannot be trained end-to-end. Recent ML approaches (DiffSBDD, AlphaFold3's diffusion module) show learned generative models can recover physically valid 3D conformations — but most operate in diffusion space, requiring hundreds of inference steps.
 
-**This project asks:** Can a flow matching model, parameterized by a lightweight SE(3)-equivariant GNN, generate low-strain small molecule binding conformations that respect pocket geometry, trainable on a laptop in under 8 weeks?
+**This project asks:** Can a flow matching model, parameterized by a lightweight SE(3)-equivariant GNN, generate low-strain small molecule binding conformations that respect pocket geometry, trainable efficiently on a Colab GPU in under 8 weeks?
 
-**Scientific hypothesis:** Flow matching's straight probability paths require fewer ODE steps than DDPM at equivalent quality, making it tractable on CPU/MPS while still producing conformations with lower MMFF94 strain energy than the ETKDG classical baseline.
+**Scientific hypothesis:** Flow matching's straight probability paths require fewer ODE steps than DDPM at equivalent quality, making it computationally tractable and fast while still producing conformations with lower MMFF94 strain energy than the ETKDG classical baseline.
 
 ---
 
-## 2. Compute Strategy (Laptop-First Design)
+## 2. Compute Strategy (Scaled via Colab)
 
-This is the most important section given the constraint. Every architectural and data decision flows from it.
+While initially constrained to a laptop, training was shifted to Google Colab GPUs. This allowed us to scale the dataset and model size while maintaining the fundamental lightweight architecture.
 
-### 2.1 Dataset Scope: 500 complexes, not 5000
-Training on the full PDBBind refined set (~5k complexes) with an EGNN on CPU would take weeks per epoch. Instead:
-- **Train set:** 400 complexes (PDBBind 2020 refined, filtered subset)
-- **Val set:** 50 complexes
-- **Test set:** 50 complexes (sampled from PDBBind core set)
+### 2.1 Dataset Scope: Full Processed Subset
+Training on Colab allowed processing of the full subset rather than a toy 500-complex split.
+- **Total raw entries processed:** 5,318
+- **Data Split:** 2,248 (Train) / 280 (Validation) / 280 (Test)
 - **Filtering:** MW < 500 Da, ≤ 7 rotatable bonds, ≤ 30 heavy atoms — keeps graphs small and forward passes fast
 
-At batch size 8, ~50 complexes/epoch on CPU with a 4-layer EGNN takes ~5–10 min/epoch. 100 epochs = ~8–16 hours of training, spread across the week. Feasible overnight.
+With Colab GPU, a 6-layer EGNN trains on ~2,248 complexes efficiently.
 
-### 2.2 Model Size: Small but principled
-- EGNN hidden dim: **64** (not 128/256)
-- EGNN layers: **4** (not 6/8)
+### 2.2 Model Size: Scaled but lightweight
+- EGNN hidden dim: **128** (scaled up from 64)
+- EGNN layers: **6** (scaled up from 4)
 - Pocket encoding: **point cloud only** (no residue-level GNN, no ESM embeddings)
 - Cross-graph edges: **k=4** (not k=8)
-- Parameter count target: **< 500K** — fast forward pass, fast gradient
+- Parameter count target: **~820K (Actual: 819,975)** — fast forward passes, easily fits in Colab GPU memory
 
 ### 2.3 Flow Matching Steps
 - Training: Euler with 1 step (single forward pass per sample, standard FM)
 - Inference: Euler with **20 steps** (not 50–100) — sufficient for small molecules
-- Each inference call: < 2 seconds on CPU for a 30-atom ligand
+- Each inference call: < 2 seconds on CPU/Colab for a 30-atom ligand
 
 ### 2.4 Precomputation (critical)
 All graph construction — featurization, edge building, pocket extraction — must be precomputed and saved as `.pt` files before any training run. Zero data processing during training loops.
 
 ---
 
-## 3. Goals & Success Metrics
+## 3. Goals & Success Metrics (Industry-Focused)
 
 ### Primary
-| Metric | Target | Baseline (ETKDG) | Notes |
-|--------|--------|-----------------|-------|
-| Median RMSD to crystal pose | < 3.0 Å | ~2.5–3.5 Å | Laptop-realistic target |
-| MMFF94 strain energy ratio | ≤ 1.3× ETKDG | 1.0× (reference) | Key differentiator |
-| Equivariance error | < 1e-4 | N/A | Unit test must pass |
-| Inference time per molecule | < 5s on CPU | ~0.3s (ETKDG) | Acceptable tradeoff |
+| Metric | Target | Comparator | Notes |
+|--------|--------|------------|-------|
+| PoseBusters PB-valid rate | Maximize; report baseline and post-UFF | AutoDock Vina PB-valid | Primary credibility metric for physical plausibility |
+| Pose accuracy (RMSD < 2Å) | Report top-1 and distribution | Vina on matched protocol | Report alongside PB-valid; do not report in isolation |
+| Throughput (ms/ligand) | Minimize on CPU and single GPU | Vina + GNINA on same machine | Core industry KPI; include speedup ratio |
+| Cross-docking success (CASF-2016) | Maximize top-1 RMSD < 2Å | Vina cross-docking | More realistic than re-docking |
 
-### Secondary (good-to-have)
+### Secondary (supporting)
 | Metric | Target |
 |--------|--------|
-| % conformations RMSD < 2Å | > 25% |
-| FM vs no-pocket ablation | FM ≥ 10% better median RMSD |
-| Training convergence | Val loss plateau within 80 epochs |
+| End-to-end screen runtime (50K compounds) | Report wall-clock and compounds/sec |
+| EF1% on one real target (EGFR or CDK2) | >= 2x random is a useful initial signal |
+| Per-check PoseBusters breakdown | Identify failure modes and remediation impact |
 
 ---
 
@@ -85,7 +84,7 @@ Pocket edges:   RBF(||xi - xj||, 16 basis functions) → 16-dim (dist < 6Å)
 Cross edges:    ligand atom ↔ pocket atom, k=4 nearest, RBF dist features
 
 ────────────────────────────────────────────────────────
-Stage 2: EGNN  (4 layers, hidden_dim=64)
+Stage 2: EGNN  (6 layers, hidden_dim=128)
 ────────────────────────────────────────────────────────
 Each EGNN layer:
   m_ij = MLP([h_i, h_j, ||x_i-x_j||², edge_attr])   # message
@@ -137,8 +136,8 @@ Stage 4: Post-processing
 | Visualization | `py3Dmol` in Jupyter | Overlay generated vs crystal |
 | Environment | `conda` + `environment.yml` | Pin all versions |
 
-**Explicitly excluded (laptop constraint):**
-- `e3nn` — complex irrep machinery, CPU bottleneck
+**Explicitly excluded (due to scale considerations):**
+- `e3nn` — complex irrep machinery, computation bottleneck
 - `gnina` — GPU-only docking evaluator
 - CrossDocked2020 — too large to preprocess locally
 - ESM-2 pocket embeddings — inference cost per forward pass
@@ -167,9 +166,10 @@ For each PDB entry:
 
 ### 6.3 Splits (deterministic, seed=42)
 ```python
-test_ids  = pdbbind_core_ids & filtered_ids          # ~50
-val_ids   = random.sample(remaining, 50)
-train_ids = remaining - val_ids                       # ~300-400
+# 2,808 successful filtered entries:
+# Train: 2,248
+# Validation: 280
+# Test: 280
 ```
 
 ---
@@ -223,7 +223,7 @@ class EGNNLayer(nn.Module):
 
 class EGNNFlowModel(nn.Module):
     """EGNN-parameterized velocity field for flow matching."""
-    def __init__(self, lig_dim, poc_dim, edge_dim, hidden=64, n_layers=4):
+    def __init__(self, lig_dim, poc_dim, edge_dim, hidden=128, n_layers=6):
         super().__init__()
         self.lig_emb = nn.Linear(lig_dim + 1, hidden)       # +1 for time
         self.poc_emb = nn.Linear(poc_dim, hidden)
@@ -290,7 +290,7 @@ def generate(model, batch, n_steps=20):
 
 ---
 
-## 9. Evaluation Suite
+## 9. Evaluation Suite (Current and Planned)
 
 ### 9.1 RMSD (geometric fidelity)
 ```python
@@ -320,52 +320,58 @@ def mmff94_energy(mol, coords):
 | No pocket | Remove all cross-graph edges |
 | ETKDG | RDKit classical baseline |
 
+### 9.4 Benchmark policy (locked)
+- PoseBusters is the primary evaluation benchmark (OOD setting and physical validity checks).
+- CASF-2016 cross-docking is the primary generalization stress test.
+- Throughput benchmarking is required against AutoDock Vina (and GNINA if available) on the same hardware.
+- LIT-PCBA is excluded from official reporting due to leakage/redundancy concerns in recent literature.
+
 ---
 
-## 10. Task Breakdown
+## 10. Four-Phase Improvement Plan (Current Roadmap)
 
-### Phase 1: Data & Environment (Week 1)
-- [ ] **T1.1** Request PDBBind 2020 access ← **do today**
-- [ ] **T1.2** Download PDBBind 2016 core (public) as dev dataset
-- [ ] **T1.3** Create conda env: rdkit, torch, torch_geometric, MDAnalysis, torchdiffeq, wandb
-- [ ] **T1.4** Write `scripts/process_pdbbind.py` (pocket extraction + featurization)
-- [ ] **T1.5** Run pipeline on 2016 core, verify ~200 complexes pass filters
-- [ ] **T1.6** Verify DataLoader yields correct shapes on a sample batch
-- [ ] **T1.7** Save `splits.json`
+### Phase 1: Evaluation Credibility (1–2 weeks, no retraining)
+- [ ] **P1.1** Run PoseBusters on current checkpoint and record baseline PB-valid + per-check pass rates (use `scripts/run_phase1_bundle.py` or `eval_posebusters.py`).
+- [ ] **P1.2** Export standardized artifacts: `results/phase1/baseline_bundle/` via bundle script; per-complex CSVs (`per_complex_raw.csv` / `per_complex_uff.csv`); optional `--export_phase1_dir` on eval.
+- [x] **P1.3** Add optional RDKit UFF post-minimization (`--uff_postprocess` on `eval_posebusters.py`).
+- [ ] **P1.4** Re-run PoseBusters with UFF and generate before/after comparison report (`compare_posebusters_runs.py`; wired by `run_phase1_bundle.py`).
+- [x] **P1.5** Lock benchmark policy in docs (PoseBusters primary; LIT-PCBA excluded) — see `docs/eval_protocol.md`, `docs/four_phase_runbook.md`.
 
-### Phase 2: EGNN (Week 2)
-- [ ] **T2.1** Implement `EGNNLayer` from scratch per Section 7
-- [ ] **T2.2** **Run equivariance unit test — hard gate, do not proceed until passing**
-- [ ] **T2.3** Implement `EGNNFlowModel` (4 layers)
-- [ ] **T2.4** Verify forward pass shapes on a single batch
-- [ ] **T2.5** Profile CPU forward pass time — target < 100ms at batch_size=8
+**Acceptance criteria:**
+- Reproducible baseline and post-UFF commands.
+- One canonical comparison artifact for interview reporting.
 
-### Phase 3: Flow Matching (Week 3)
-- [ ] **T3.1** Toy FM sanity check: 2D moons dataset, visualize trajectories
-- [ ] **T3.2** Implement `train_epoch` and `generate` (Section 8)
-- [ ] **T3.3** Overfit on 5 complexes (200 epochs) — verify train RMSD < 0.5Å
-- [ ] **T3.4** Connect wandb logging (loss, grad norm, sample RMSD every 10 epochs)
-- [ ] **T3.5** Add cosine LR decay with 5-epoch warmup
+### Phase 2: Throughput Benchmarking (1 week, no retraining)
+- [x] **P2.1** Implement timing harness for model CPU/GPU, Vina, and GNINA on matched compound set (`scripts/benchmark_throughput.py`; FlowMatch engine; PDBBind manifest helper).
+- [ ] **P2.2** Report mean/std/median/p95 latency, compounds/sec, and speedup ratios vs Vina (requires finished runs + `timing_raw.csv`).
+- [x] **P2.3** Add pipeline profiling (featurization, graph build, model forward, postprocess, I/O) — `scripts/bench/profile_benchmark.py`, `scripts/bench/run_benchmark.py`.
+- [ ] **P2.4** Document at least one bottleneck and one optimization recommendation (`eval/throughput/optimization_log.md` exists; refresh after measurements).
 
-### Phase 4: Training (Week 4)
-- [ ] **T4.1** Train on full train set overnight (~80–100 epochs)
-- [ ] **T4.2** Compare 3 configs: hidden_dim = 32 / 64 / 128
-- [ ] **T4.3** Early stopping on val RMSD (patience = 15 epochs)
-- [ ] **T4.4** Save best checkpoint as `checkpoints/best_model.pt`
+**Acceptance criteria:**
+- `results/phase2/timing_raw.csv` and summarized speedup report exist and are reproducible.
 
-### Phase 5: Evaluation (Week 5)
-- [ ] **T5.1** Generate conformations for all 50 test complexes
-- [ ] **T5.2** Run ETKDG on all 50 test complexes (RDKit, ~1 min)
-- [ ] **T5.3** Compute Kabsch RMSD distributions (generated vs crystal, ETKDG vs crystal)
-- [ ] **T5.4** Compute MMFF94 strain energy ratios
-- [ ] **T5.5** Retrain no-pocket ablation overnight, compute delta RMSD
-- [ ] **T5.6** Generate result table + RMSD histogram figure
+### Phase 3: Cross-Docking Generalization (2 weeks, no retraining)
+- [x] **P3.1** Implement CASF-2016 cross-docking preparation and protocol runner (`prepare_casf_crossdock.py`, `run_model_crossdock.py`, `run_vina_crossdock.py`, `prepare_pdbqt_for_vina.py`).
+- [ ] **P3.2** Evaluate model top-1 RMSD < 2Å with per-target breakdown (`evaluate_crossdock.py`; needs CASF index + runs).
+- [ ] **P3.3** Run matched Vina cross-docking baseline on same protocol (`run_crossdock_bundle.py`; needs Vina + obabel + PDBQT).
+- [x] **P3.4** Produce apples-to-apples comparison report with explicit assumptions (`evaluate_crossdock.py` → `crossdock_report.md`; bundle copies to `model_vs_vina.md`).
 
-### Phase 6: Polish (Week 6)
-- [ ] **T6.1** Write README with architecture overview and results table
-- [ ] **T6.2** Add `scripts/verify_equivariance.py` as standalone script
-- [ ] **T6.3** Create py3Dmol Jupyter notebook: overlay generated vs crystal (3 complexes)
-- [ ] **T6.4** Push public to GitHub
+**Acceptance criteria:**
+- Cross-docking report with model-vs-Vina metrics from a shared evaluator.
+
+### Phase 4: One Real Target Screening Story (2–3 weeks)
+- [ ] **P4.1** Select target (EGFR or CDK2) and build ~50K screened library (ZINC22 + filters); `build_library.py` + `run_phase4_screening_bundle.py` orchestrate once CSV exists.
+- [ ] **P4.2** Run full-library inference; log wall-clock runtime and throughput (`run_screen.py` / bundle writes `runtime.json`).
+- [x] **P4.3** Compute EF1% using known actives mapping (`evaluate_enrichment.py`; bundle runs it).
+- [x] **P4.4** Generate top-hit interpretation report (novelty/Tanimoto + drug-likeness descriptors) (`analyze_top_hits.py`; bundle runs it).
+
+**Acceptance criteria:**
+- Reproducible target-specific case study with runtime and enrichment headline metrics.
+
+### Parallel execution policy
+- Phase 1 metrics generation is the credibility gate and should begin first.
+- Phases 2, 3, and 4 scaffolding can run in parallel immediately (scripts/config/data prep).
+- Final reported metrics for Phases 2–4 must be rechecked under the finalized Phase 1 inference policy.
 
 ---
 
@@ -385,8 +391,9 @@ def mmff94_energy(mol, coords):
 |------|-----------|------------|
 | PDBBind 2020 access delayed | Medium | Use 2016 core (public) for full cycle; swap for final run |
 | EGNN equivariance bug (silent) | **High** | T2.2 is a hard gate — never skip |
-| CPU training too slow | Medium | Drop hidden_dim to 32, batch_size to 4, use 50 complexes |
-| Val RMSD worse than ETKDG | Medium | Reframe around strain energy — still a valid result |
+| CPU training too slow | Resolved | Migrated to Colab GPU for training |
+| Re-docking looks strong but OOD validity is weak | High | Prioritize PoseBusters and cross-docking over re-docking-only claims |
+| Benchmark credibility challenged (data leakage concern) | Medium | Exclude LIT-PCBA from official claims; document benchmark rationale |
 | Chirality assignment fails | Low | Flag as limitation in README |
 | ODE divergence at inference | Low | Clip coord updates to max 5Å per step |
 
@@ -413,4 +420,13 @@ def mmff94_energy(mol, coords):
 
 ---
 
-*Revised for laptop-only compute — April 2026*
+## 15. Interview Narrative Targets
+
+- **After Phase 1:** "Measured PB-valid and improved physical plausibility with lightweight UFF post-processing."
+- **After Phase 2:** "Achieved Xx speedup vs Vina at reported PoseBusters-aligned quality."
+- **After Phase 3:** "Quantified cross-docking drop vs re-docking and benchmarked against Vina under matched protocol."
+- **After Phase 4:** "Ran a real target screen (50K compounds), reported runtime and EF1%, and interpreted top novel hits."
+
+---
+
+*Revised for four-phase industry improvement plan — April 2026*

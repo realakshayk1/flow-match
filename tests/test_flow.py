@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch_geometric.data import HeteroData
 
+from src.data.dataset import _move_edges_to_edge_stores
 from src.models.egnn import EGNNFlowModel
 from src.models.flow_model import FlowMatcher, _clamp_update
 
@@ -40,7 +41,7 @@ def _make_hetero_batch(n_lig=5, n_poc=8, k=4):
     data["pocket", "to", "ligand"].edge_index = torch.stack([poc_idx, lig_idx])
     data["pocket", "to", "ligand"].edge_attr  = torch.randn(n_lig * k, 16)
 
-    return data
+    return _move_edges_to_edge_stores(data)
 
 
 @pytest.fixture
@@ -74,6 +75,68 @@ def test_compute_loss_is_finite(flow_matcher, single_graph_batch):
     """Loss must not be NaN or inf."""
     loss = flow_matcher.compute_loss(single_graph_batch)
     assert torch.isfinite(loss), f"Loss is not finite: {loss.item()}"
+
+
+def test_geom_loss_weight_changes_loss_and_backprops(single_graph_batch):
+    """With geom_loss_weight > 0 the loss stays finite, differs from the pure-FM loss,
+    and gradients flow to model parameters."""
+    torch.manual_seed(0)
+    model = EGNNFlowModel()
+    fm_plain = FlowMatcher(model, n_steps=20, geom_loss_weight=0.0)
+    fm_geom = FlowMatcher(model, n_steps=20, geom_loss_weight=0.5)
+
+    torch.manual_seed(123)
+    base = fm_plain.compute_loss(single_graph_batch)
+    torch.manual_seed(123)
+    withg = fm_geom.compute_loss(single_graph_batch)
+
+    assert torch.isfinite(withg)
+    assert withg.item() >= base.item() - 1e-6  # geom term is non-negative
+    assert abs(withg.item() - base.item()) > 1e-9  # it actually contributed
+
+    withg.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+# ---------------------------------------------------------------------------
+# Multi-pose + confidence
+# ---------------------------------------------------------------------------
+
+def test_generate_multi_shapes(single_graph_batch):
+    model = EGNNFlowModel()
+    fm = FlowMatcher(model, n_steps=5)
+    poses = fm.generate_multi(single_graph_batch, n_poses=4, n_steps=5)
+    assert len(poses) == 4
+    assert len(poses[0]) == 1            # one graph
+    assert poses[0][0].shape == (5, 3)   # n_lig x 3
+
+
+def test_confidence_scores_and_loss(single_graph_batch):
+    model = EGNNFlowModel(with_confidence=True)
+    fm = FlowMatcher(model, n_steps=5)
+    poses = fm.generate_multi(single_graph_batch, n_poses=2, n_steps=5)
+
+    scores = fm.confidence_scores(single_graph_batch, poses[0])
+    assert scores.shape == (1,)
+    assert float(scores.min()) >= 0.0 and float(scores.max()) <= 1.0
+
+    labels = torch.tensor([1.0])
+    loss = fm.confidence_loss(single_graph_batch, poses[0], labels)
+    assert torch.isfinite(loss)
+    loss.backward()
+    head_grads = [p.grad for n, p in model.named_parameters()
+                  if "confidence_head" in n and p.grad is not None]
+    assert head_grads and all(torch.isfinite(g).all() for g in head_grads)
+
+
+def test_confidence_head_requires_flag(single_graph_batch):
+    """Calling the confidence path on a model built without the head should error clearly."""
+    model = EGNNFlowModel(with_confidence=False)
+    fm = FlowMatcher(model, n_steps=5)
+    poses = fm.generate_multi(single_graph_batch, n_poses=1, n_steps=5)
+    with pytest.raises(RuntimeError):
+        fm.confidence_scores(single_graph_batch, poses[0])
 
 
 def test_compute_loss_backward(flow_matcher, single_graph_batch):

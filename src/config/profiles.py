@@ -36,6 +36,8 @@ class HardwareProfile:
     val_inference_steps: int
     # Default device string passed to detect_device()
     default_device: str
+    # Weight on the bonded-geometry auxiliary training loss (0 disables it).
+    geom_loss_weight: float = 0.0
 
 
 PROFILES: dict[str, HardwareProfile] = {
@@ -77,7 +79,7 @@ PROFILES: dict[str, HardwareProfile] = {
         lr=3e-4,            patience=25,
         amp_dtype="float16", compile_model=True,
         n_inference_steps=50, val_inference_steps=15,
-        default_device="cuda",
+        default_device="cuda", geom_loss_weight=0.1,
     ),
     # ------------------------------------------------------------------ A100 (40/80 GB VRAM, 4 vCPU)
     "a100": HardwareProfile(
@@ -87,7 +89,7 @@ PROFILES: dict[str, HardwareProfile] = {
         lr=3e-4,            patience=30,
         amp_dtype="bfloat16", compile_model=True,
         n_inference_steps=100, val_inference_steps=20,
-        default_device="cuda",
+        default_device="cuda", geom_loss_weight=0.1,
     ),
     # ------------------------------------------------------------------ H100 (80 GB VRAM, 4 vCPU)
     "h100": HardwareProfile(
@@ -97,6 +99,6 @@ PROFILES: dict[str, HardwareProfile] = {
         lr=3e-4,            patience=30,
         amp_dtype="bfloat16", compile_model=True,
         n_inference_steps=100, val_inference_steps=20,
-        default_device="cuda",
+        default_device="cuda", geom_loss_weight=0.1,
     ),
 }

@@ -1,0 +1,87 @@
+{
+  "ligand_glob": "eval/posebusters_raw/poses/*_pred.sdf",
+  "max_ligands": 12,
+  "warmup": 2,
+  "repeats": 6,
+  "backend_order": [
+    "model_cpu",
+    "model_gpu",
+    "vina",
+    "gnina"
+  ],
+  "speedup_reference": "model_cpu",
+  "backends": {
+    "model_cpu": {
+      "command": [
+        "python",
+        "scripts/bench/stub_model_backend.py",
+        "--device",
+        "cpu",
+        "--ligand",
+        "{ligand_path}",
+        "--work-ms",
+        "9"
+      ]
+    },
+    "model_gpu": {
+      "command": [
+        "python",
+        "scripts/bench/stub_model_backend.py",
+        "--device",
+        "cuda",
+        "--ligand",
+        "{ligand_path}",
+        "--work-ms",
+        "6"
+      ]
+    },
+    "vina": {
+      "command": [
+        "vina",
+        "--receptor",
+        "{receptor_pdbqt}",
+        "--ligand",
+        "{ligand_pdbqt}",
+        "--center_x",
+        "0",
+        "--center_y",
+        "0",
+        "--center_z",
+        "0",
+        "--size_x",
+        "20",
+        "--size_y",
+        "20",
+        "--size_z",
+        "20",
+        "--exhaustiveness",
+        "8"
+      ],
+      "skip_if_missing": true
+    },
+    "gnina": {
+      "command": [
+        "gnina",
+        "-r",
+        "{protein_path}",
+        "-l",
+        "{ligand_path}",
+        "--center_x",
+        "0",
+        "--center_y",
+        "0",
+        "--center_z",
+        "0",
+        "--size_x",
+        "20",
+        "--size_y",
+        "20",
+        "--size_z",
+        "20",
+        "--exhaustiveness",
+        "8"
+      ],
+      "skip_if_missing": true
+    }
+  }
+}

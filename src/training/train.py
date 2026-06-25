@@ -480,7 +480,11 @@ def train(config: argparse.Namespace):
         except Exception as e:
             print(f"torch.compile failed ({e}), continuing without it.")
 
-    flow_matcher = FlowMatcher(model, n_steps=config.n_inference_steps).to(device)
+    flow_matcher = FlowMatcher(
+        model,
+        n_steps=config.n_inference_steps,
+        geom_loss_weight=getattr(config, "geom_loss_weight", 0.0),
+    ).to(device)
 
     # --- AMP setup ---
     use_amp, amp_torch_dtype, scaler = _build_amp(profile, device)
@@ -585,6 +589,9 @@ def parse_args():
     p.add_argument("--patience",            type=int,   default=None)
     p.add_argument("--n_inference_steps",   type=int,   default=None)
     p.add_argument("--val_inference_steps", type=int,   default=None)
+    p.add_argument("--geom_loss_weight",    type=float, default=None,
+                   help="Weight on bonded-geometry auxiliary loss (0 disables). "
+                        "Default: profile value.")
     p.add_argument("--device",              type=str,   default=None,
                    help="Override device. Default: profile's default_device.")
 
@@ -619,6 +626,7 @@ def parse_args():
     if args.patience            is None: args.patience            = profile.patience
     if args.n_inference_steps   is None: args.n_inference_steps   = profile.n_inference_steps
     if args.val_inference_steps is None: args.val_inference_steps = profile.val_inference_steps
+    if args.geom_loss_weight    is None: args.geom_loss_weight    = profile.geom_loss_weight
     if args.device              is None: args.device              = profile.default_device
 
     # num_workers: force 0 on Windows (no fork support)
