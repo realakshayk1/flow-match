@@ -130,6 +130,21 @@ def test_confidence_scores_and_loss(single_graph_batch):
     assert head_grads and all(torch.isfinite(g).all() for g in head_grads)
 
 
+def test_load_model_state_strips_compile_prefix():
+    """Checkpoints saved from a torch.compile'd model carry an '_orig_mod.' key prefix;
+    load_model_state must accept both prefixed and plain state dicts."""
+    from src.models.egnn import build_default_model, load_model_state
+    src = build_default_model()
+    plain = src.state_dict()
+    compiled = {f"_orig_mod.{k}": v for k, v in plain.items()}
+
+    dst = build_default_model()
+    load_model_state(dst, compiled)   # must not raise
+    load_model_state(dst, plain)      # must not raise
+    for k in plain:
+        assert torch.equal(dst.state_dict()[k], plain[k])
+
+
 def test_confidence_head_requires_flag(single_graph_batch):
     """Calling the confidence path on a model built without the head should error clearly."""
     model = EGNNFlowModel(with_confidence=False)

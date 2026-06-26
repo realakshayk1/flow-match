@@ -131,6 +131,9 @@ def main() -> None:
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         run_cfg = ckpt.get("run_config", {})
         state = ckpt["model_state"]
+        # Strip torch.compile "_orig_mod." prefix (L4/A100/H100 profiles) if present.
+        if any(k.startswith("_orig_mod.") for k in state):
+            state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
         hidden_dim = args.hidden_dim
         if hidden_dim is None:
             hidden_dim = run_cfg.get("hidden_dim", state["lig_emb.weight"].shape[0])

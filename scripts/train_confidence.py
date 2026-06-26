@@ -79,14 +79,18 @@ def main():
 
     device = torch.device(args.device)
     ckpt = torch.load(args.base_checkpoint, map_location="cpu", weights_only=False)
+    # Strip the torch.compile "_orig_mod." prefix (L4/A100/H100 profiles) before inspecting keys.
+    base_state = ckpt["model_state"]
+    if any(k.startswith("_orig_mod.") for k in base_state):
+        base_state = {k.replace("_orig_mod.", "", 1): v for k, v in base_state.items()}
     rc = ckpt.get("run_config", {})
-    hidden_dim = rc.get("hidden_dim", ckpt["model_state"]["lig_emb.weight"].shape[0])
-    layer_idx = [int(k.split(".")[1]) for k in ckpt["model_state"] if k.startswith("layers.")]
+    hidden_dim = rc.get("hidden_dim", base_state["lig_emb.weight"].shape[0])
+    layer_idx = [int(k.split(".")[1]) for k in base_state if k.startswith("layers.")]
     n_layers = rc.get("n_layers", max(layer_idx) + 1 if layer_idx else 4)
 
     model = build_default_model(hidden_dim=hidden_dim, n_layers=n_layers, with_confidence=True)
     # Load base weights; confidence head stays at its random init.
-    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+    missing, unexpected = model.load_state_dict(base_state, strict=False)
     print(f"Loaded base. Missing (expected = confidence head): {missing}")
     model = model.to(device)
     flow_matcher = FlowMatcher(model, n_steps=args.n_steps).to(device)

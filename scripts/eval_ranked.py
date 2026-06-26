@@ -27,7 +27,7 @@ from rdkit import Chem
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.data.dataset import PDBBindDataset, load_splits, make_dataloader
-from src.models.egnn import build_default_model
+from src.models.egnn import build_default_model, load_model_state
 from src.models.flow_model import FlowMatcher
 from src.training.metrics import symmetry_rmsd
 
@@ -57,7 +57,7 @@ def main():
     n_layers = rc.get("n_layers", max(layer_idx) + 1 if layer_idx else 4)
 
     model = build_default_model(hidden_dim=hidden_dim, n_layers=n_layers, with_confidence=True)
-    model.load_state_dict(ckpt["model_state"])
+    load_model_state(model, ckpt["model_state"])
     model = model.to(device)
     flow_matcher = FlowMatcher(model, n_steps=args.n_steps).to(device)
     flow_matcher.eval()
