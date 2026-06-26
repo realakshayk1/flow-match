@@ -9,7 +9,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.flow_model import FlowMatcher
-from src.models.egnn import count_parameters, build_default_model
+from src.models.egnn import count_parameters, build_default_model, load_model_state
 from src.data.dataset import PDBBindDataset, load_splits, make_dataloader
 from src.training.metrics import compute_test_metrics
 
@@ -36,7 +36,7 @@ def main():
     print(f"Loaded {len(test_ds)} test complexes.")
 
     model = build_default_model(hidden_dim=hidden_dim, n_layers=n_layers).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    load_model_state(model, ckpt["model_state"])
     flow_matcher = FlowMatcher(model, n_steps=args.n_inference_steps).to(device)
     
     print("\nComputing test metrics ...")

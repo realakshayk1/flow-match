@@ -43,7 +43,7 @@ from src.data.featurize import (
     featurize_pocket,
     build_cross_edges,
 )
-from src.models.egnn import build_default_model
+from src.models.egnn import build_default_model, load_model_state
 from src.models.flow_model import FlowMatcher
 from src.training.metrics import kabsch_rmsd, mmff94_energy
 
@@ -247,7 +247,7 @@ def main():
     hidden_dim = run_config.get("hidden_dim", 128)
     n_layers   = run_config.get("n_layers", 6)
     model = build_default_model(hidden_dim=hidden_dim, n_layers=n_layers).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    load_model_state(model, ckpt["model_state"])
     model.eval()
     flow_matcher = FlowMatcher(model, n_steps=args.n_steps).to(device)
     print(f"Model loaded (hidden_dim={hidden_dim}, n_layers={n_layers})")

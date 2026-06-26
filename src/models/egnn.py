@@ -343,3 +343,14 @@ def build_default_model(**kwargs) -> EGNNFlowModel:
     )
     defaults.update(kwargs)
     return EGNNFlowModel(**defaults)
+
+
+def load_model_state(model: nn.Module, state_dict: dict, strict: bool = True):
+    """
+    Load a checkpoint state_dict into ``model``, tolerating the ``_orig_mod.`` key prefix that
+    ``torch.compile`` adds when a compiled model is saved (L4/A100/H100 profiles). Strips the
+    prefix if present, then delegates to ``model.load_state_dict``.
+    """
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    return model.load_state_dict(state_dict, strict=strict)

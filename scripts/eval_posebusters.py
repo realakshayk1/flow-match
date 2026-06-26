@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from posebusters import PoseBusters
 from src.data.dataset import PDBBindDataset, load_splits, make_dataloader
-from src.models.egnn import build_default_model
+from src.models.egnn import build_default_model, load_model_state
 from src.models.flow_model import FlowMatcher
 from src.training.metrics import (
     kabsch_rmsd, symmetry_rmsd, mol_with_coords, uff_minimize, pocket_aware_relax,
@@ -118,7 +118,7 @@ def main():
         n_layers = run_config.get("n_layers", max(layer_indices) + 1 if layer_indices else 6)
 
     model = build_default_model(hidden_dim=hidden_dim, n_layers=n_layers).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    load_model_state(model, ckpt["model_state"])
     flow_matcher = FlowMatcher(model, n_steps=args.n_inference_steps).to(device)
     flow_matcher.eval()
     print(f"Loaded checkpoint: {args.checkpoint}")
