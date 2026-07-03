@@ -1,115 +1,113 @@
-# Flow-Match Four-Phase Evaluation Stack
+# Flow-Match: SE(3)-Equivariant Flow Matching for Pocket-Conditioned Ligand Pose Generation
 
-This repository is organized around an integrated four-phase improvement plan:
+A lightweight (**819,975-parameter**) SE(3)-equivariant EGNN trained with conditional flow
+matching to generate small-molecule binding poses given a protein pocket. The emphasis of this
+repo is **evaluation honesty**: every headline number is an in-frame, symmetry-corrected docking
+RMSD reported jointly with PoseBusters physical validity, on a leakage-controlled split.
 
-1. Phase 1: PoseBusters baseline + UFF comparison
-2. Phase 2: Throughput/profiling against external baselines
-3. Phase 3: CASF-style cross-docking with model-vs-Vina comparison
-4. Phase 4: Real-target screening, EF1%, and top-hit interpretation
+> **Task framing (read first).** This is **pocket-conditioned re-docking**: the binding-site
+> point cloud is provided as input (extracted around the crystal ligand). This is a
+> substantially easier task than **blind docking** (DiffDock, FlowDock, etc., which take the
+> whole protein). **Do not compare the numbers below to blind-docking benchmarks** — the tasks
+> are different.
 
-## Canonical Docs
+## Results
 
-- `docs/four_phase_runbook.md` - step-by-step commands per phase
-- `docs/eval_protocol.md` - benchmark policy, assumptions, caveats
-- `results/single_source_of_truth.md` - current best numbers and pending runs
-- `docs/integration_milestone_status.md` - done/partial/blocked status
-- `PRD.me` - project rationale and roadmap context
+Model: 819,975 params (hidden=128, 6 EGNN layers), 20–50-step Euler inference.
+Split: **ligand-declustered** PDBBind (Butina clustering on Morgan/Tanimoto, whole clusters
+assigned to one split). Test = 464 complexes. Median train↔test max-Tanimoto **0.368**
+(vs **0.693** for a random split, and **1.00** — i.e. identical ligands — for the original
+seed-42 split). Poses are polished with a pocket-restrained MMFF relaxation (`--relax pocket`).
 
-## Quick Start
+| Metric | Value |
+|---|---:|
+| **RMSD < 2 Å AND PB-valid** (headline joint metric) | **68.3%** |
+| PoseBusters valid (`mol` checks) | 80.8% |
+| Dock RMSD < 2 Å (in-frame, symmetry-corrected) | 74.1% |
+| Dock RMSD, median | 1.36 Å |
+| Shape RMSD, median (Kabsch-aligned; **not** docking) | 1.09 Å |
+| ETKDG baseline, shape RMSD < 2 Å | 65.9% |
 
-### Phase 1 Bundle
+**Two metrics, on purpose.** *Dock RMSD* is measured in the crystal frame with no
+superposition and with molecular-symmetry correction — it reflects whether the ligand is
+*placed* correctly. *Shape RMSD* is Kabsch-aligned (rotation+translation removed) — it only
+reflects conformer shape and is **not** a docking metric. We report both so the gap is visible.
 
-```bash
-python scripts/run_phase1_bundle.py --checkpoint checkpoints/best_model.pt --out_root results/phase1 --split test --n_inference_steps 20 --device cpu
-```
+**Physical validity requires the relaxation step.** Raw model output passes almost no
+PoseBusters bond-geometry checks (PB-valid ≈ 0%); the pocket-restrained MMFF relaxation lifts
+PB-valid to ~81% while barely changing dock RMSD (≈ +0.07 Å median). This mirrors the
+"+energy-minimization" recipe reported for FlowDock.
 
-### Phase 3 Bundle
+**Confidence ranking / selective prediction** (multi-pose + a shared-trunk confidence head).
+On a strong base model most sampled poses are already correct (~79%), so confidence-ranked
+top-1 (75.8%) ≈ random top-1 (75.4%). But the head is well-calibrated for *triage*: restricting
+to the most-confident subset gives 95.8% success at 66% coverage, 98.3% at 50%, and 100% at 10%.
 
-```bash
-python scripts/run_crossdock_bundle.py --manifest_csv eval/crossdock/manifest.csv --out_root results/phase3/run --checkpoint checkpoints/best_model.pt
-```
+### Honest caveats
+- **Pocket-conditioned, not blind.** The binding site is given. Not comparable to blind-docking
+  numbers (DiffDock ~38% RMSD<2Å, FlowDock ~51% PB-valid on the PoseBusters set).
+- **The split de-duplicates ligands, not proteins.** Test proteins may still appear in training,
+  so this is "novel-ish ligands on known pockets," not full generalization. A true
+  generalization number requires evaluating on the **PoseBusters benchmark set** (post-2021
+  complexes) or adding protein/sequence clustering to the split — **pending**.
+- **No external baselines run yet on this set.** Vina/GNINA/DiffDock have not been run on these
+  exact complexes, so no head-to-head "competitive with X" claim is made. The shared evaluator
+  (`scripts/baselines/score_external_poses.py`) exists to do this — **pending**.
 
-### Phase 4 Bundle
+## Method
 
-```bash
-python scripts/run_phase4_screening_bundle.py --target cdk2 --input_csv data/screening/library_templates/toy_library.csv --known_actives_csv data/screening/targets/cdk2/known_actives.csv --out_root results/phase4/cdk2_bundle
-```
+1. **Featurize** ligand graph (topology only, no coordinates) + pocket point cloud (atoms within
+   10 Å of the ligand centroid). Precomputed to `HeteroData` `.pt` files.
+2. **EGNN velocity field** (SE(3)-equivariant, verified numerically to ~1e-8). Pocket coordinates
+   are held fixed; cross-edges flow pocket→ligand.
+3. **Conditional flow matching**: linear interpolant from N(0,I) noise to crystal coords, constant
+   target velocity, optional bonded-geometry auxiliary loss (`--geom_loss_weight`).
+4. **Inference**: 20–50-step Euler, then pocket-restrained MMFF relaxation.
+5. **Eval**: in-frame symmetry-corrected dock RMSD + PoseBusters `mol` checks, reported jointly.
 
-## Current Integration Status
+## Reproduce
 
-- Phase 1: runnable and smoke-validated; full reruns may still be pending.
-- Phase 2: harness is in place; real Vina/GNINA benchmarking depends on local binaries and prepared manifest fields.
-- Phase 3: prep/runners/evaluator exist; full runs depend on checkpoint and docking toolchain.
-- Phase 4: library/screen/enrichment/top-hit scripts are present; full-scale runs depend on larger input libraries.
-
-## Scientific Caveats
-
-- PoseBusters `mol` mode checks ligand geometry, not full protein-context docking validity.
-- Re-docking and cross-docking are different settings and should be reported separately.
-- Throughput speedup claims are only final after matched-input external-engine runs.
-- EF1% claims must include active-set provenance and explicit random baseline.
-# Flow-Match Four-Phase Evaluation Stack
-
-This repository contains a lightweight SE(3)-equivariant flow-matching model and an integrated four-phase evaluation pipeline:
-
-- Phase 1: PoseBusters baseline and UFF post-processing
-- Phase 2: Throughput/profiling against external baselines
-- Phase 3: CASF-style cross-docking + Vina comparison
-- Phase 4: Real-target screening + EF1% + top-hit interpretation
-
-For the operational workflow, use:
-
-- `docs/four_phase_runbook.md` (single runbook)
-- `docs/eval_protocol.md` (benchmark and caveat policy)
-- `results/single_source_of_truth.md` (latest integrated status)
-
-## Quick Start (Integrated)
-
-### Phase 1 bundle
-
-```bash
-python scripts/run_phase1_bundle.py --checkpoint checkpoints/best_model.pt --out_root results/phase1 --split test --n_inference_steps 20 --device cpu
-```
-
-### Phase 2 setup and smoke
+Data (PDBBind processed `.pt` files) and checkpoints are not committed (gitignored). Training was
+run on Colab (L4). See **`docs/colab_guide.md`** for the full notebook, and
+`docs/four_phase_runbook.md` / `docs/eval_protocol.md` for per-phase commands and policy.
 
 ```bash
-python scripts/benchmark_throughput.py inspect --out_dir eval/throughput
-python scripts/benchmark_throughput.py prepare-manifest --poses_dir eval/posebusters_uff/poses --out_manifest eval/benchmark_100/manifest.csv --limit 100
-python scripts/benchmark_throughput.py benchmark --engine noop --manifest eval/benchmark_100/manifest.csv --out_dir eval/throughput/noop --warmup 5 --repeats 100
+# Leakage-controlled split
+python scripts/build_clean_split.py --out data/splits_clean.json --cutoff 0.5
+
+# Train (L4/A100/H100 profiles use torch.compile + AMP; add --geom_loss_weight 0.1)
+python -m src.training.train --profile l4 --geom_loss_weight 0.1 \
+    --splits data/splits_clean.json --n_epochs 100 --checkpoint_dir checkpoints/clean
+
+# Honest eval: in-frame dock RMSD + PB-valid, with pocket relaxation
+python scripts/eval_posebusters.py --checkpoint checkpoints/clean/best_model.pt \
+    --splits data/splits_clean.json --split test --n_inference_steps 50 --relax pocket \
+    --output_dir results/phase3/clean_eval
+
+# Multi-pose + confidence ranking
+python scripts/train_confidence.py --base_checkpoint checkpoints/clean/best_model.pt \
+    --out_checkpoint checkpoints/clean_conf.pt --split train --n_poses 8 --epochs 5
+python scripts/eval_ranked.py --checkpoint checkpoints/clean_conf.pt --split test --n_poses 10
 ```
 
-### Phase 3 bundle
+## Status
 
-```bash
-python scripts/run_crossdock_bundle.py --manifest_csv eval/crossdock/manifest.csv --out_root results/phase3/smoke --dry_run --limit_pairs 5
-```
-
-### Phase 4 bundle
-
-```bash
-python scripts/run_phase4_screening_bundle.py --target cdk2 --input_csv data/screening/library_templates/toy_library.csv --known_actives_csv data/screening/targets/cdk2/known_actives.csv --out_root results/phase4/cdk2_bundle_smoke
-```
-
-## Current Integration State
-
-- Phase 1/2 tooling is integrated and runnable.
-- Phase 3/4 scaffolds and bundle scripts are present and smoke-runnable.
-- External benchmark quality depends on local environment:
-  - `vina`, `gnina`, and `obabel` availability
-  - prepared receptor/ligand inputs for docking baselines
-
-Always treat `results/single_source_of_truth.md` as the canonical status for interview-facing claims.
-
-## Scientific Caveats
-
-- PoseBusters in `mol` mode is ligand geometry validity, not full protein-context docking validity.
-- Re-docking, cross-docking, and screening enrichment are separate evidence tiers and should not be conflated.
-- LIT-PCBA is excluded from official claims per protocol due leakage/redundancy concerns.
+| Piece | State |
+|---|---|
+| SE(3)-equivariant EGNN + flow matching | done, equivariance-tested |
+| In-frame symmetry-corrected dock RMSD + joint PB-valid metric | done |
+| Pocket-restrained relaxation (physical validity) | done |
+| Bonded-geometry auxiliary loss | done |
+| Multi-pose + confidence head + selective-prediction curve | done |
+| Leakage-controlled (ligand-declustered) split + retrain | done |
+| Eval on the true PoseBusters benchmark set (post-2021) | **pending** |
+| Real Vina/GNINA/DiffDock baselines on the same complexes | **pending** |
 
 ## References
 
-- Satorras et al. 2021, E(n)-Equivariant GNNs
-- Lipman et al. 2022, Flow Matching
-- Corso et al. 2023, DiffDock
-- Buttenschoen et al. 2024, PoseBusters
+- Satorras, Hoogeboom, Welling (2021) — E(n)-Equivariant GNNs
+- Lipman et al. (2022) — Flow Matching for Generative Modeling
+- Corso et al. (2023) — DiffDock
+- Buttenschoen et al. (2024) — PoseBusters
+- Morehead et al. (2024) — FlowDock
+- PDBbind CleanSplit / Leak-Proof PDBBind — split-leakage methodology
